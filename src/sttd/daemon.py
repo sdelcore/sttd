@@ -54,10 +54,11 @@ class Daemon:
         self._audio_chunk_queue: queue.Queue[np.ndarray | None] = queue.Queue()
         self._streaming_thread: threading.Thread | None = None
 
-        # Cumulative transcription tracking
+        # Streaming transcription tracking
         self._accumulated_audio: list[np.ndarray] = []
         self._previous_text: str = ""
         self._previous_text_len: int = 0
+        self._finalized_context: str = ""  # Context from chunks that fell off window
 
         # PID file
         self._pid_path = get_pid_path()
@@ -132,10 +133,11 @@ class Daemon:
                 except queue.Empty:
                     break
 
-            # Reset cumulative transcription state
+            # Reset streaming transcription state
             self._accumulated_audio = []
             self._previous_text = ""
             self._previous_text_len = 0
+            self._finalized_context = ""
 
             # Start streaming transcription thread
             self._streaming_thread = threading.Thread(
@@ -213,56 +215,56 @@ class Daemon:
         self._audio_chunk_queue.put(audio_data)
 
     def _streaming_transcribe(self) -> None:
-        """Background thread for cumulative streaming transcription.
+        """Background thread for streaming transcription with sliding window.
 
-        Uses cumulative refinement: each new chunk is added to accumulated audio,
-        and the entire buffer is re-transcribed for better context and accuracy.
+        Uses a sliding window to keep memory bounded. When chunks fall off the
+        window, their text is preserved as context via initial_prompt.
         """
-        logger.info("Streaming transcription thread started (cumulative mode)")
+        logger.info("Streaming transcription thread started")
+        max_chunks = int(
+            self.config.transcription.max_window / self.config.transcription.chunk_duration
+        )
 
         while self._state == DaemonState.RECORDING:
             try:
-                # Wait for a chunk with timeout
                 chunk = self._audio_chunk_queue.get(timeout=0.5)
 
                 if chunk is None:
-                    # Stop signal received
                     break
 
-                # Add to accumulated audio
                 self._accumulated_audio.append(chunk)
 
-                # Ensure transcriber is ready
+                # Sliding window: trim oldest chunks, preserve text as context
+                while len(self._accumulated_audio) > max_chunks:
+                    self._accumulated_audio.pop(0)
+                    if self._previous_text:
+                        self._finalized_context = self._previous_text
+
                 if self._transcriber is None:
                     self._transcriber = Transcriber(self.config.transcription)
 
-                # Transcribe ENTIRE accumulated audio for better context
                 full_audio = np.concatenate(self._accumulated_audio)
                 new_text = self._transcriber.transcribe_audio(
                     full_audio,
                     sample_rate=self.config.audio.sample_rate,
+                    initial_prompt=self._finalized_context or None,
                 )
 
                 if new_text:
                     new_text = new_text.strip()
 
-                # Only update if text changed
                 if new_text and new_text != self._previous_text:
-                    logger.info(f"Streaming transcribed ({len(self._accumulated_audio)} chunks): {new_text[:50]}...")
+                    logger.info(f"Streaming ({len(self._accumulated_audio)} chunks): {new_text[:50]}...")
 
-                    # Delete previous text with backspaces
                     if self._previous_text_len > 0:
                         inject_backspaces(self._previous_text_len)
 
-                    # Type new refined text
                     inject_text(new_text, self.config.output.method)
 
-                    # Update tracking
                     self._previous_text = new_text
                     self._previous_text_len = len(new_text)
 
             except queue.Empty:
-                # No chunk available, continue waiting
                 continue
             except Exception as e:
                 logger.warning(f"Streaming transcription error: {e}")

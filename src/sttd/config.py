@@ -18,8 +18,9 @@ class TranscriptionConfig:
     device: str = "auto"
     compute_type: str = "auto"
     language: str = "en"
-    streaming: bool = True  # Enable continuous streaming transcription
-    chunk_duration: float = 2.0  # Seconds per chunk for streaming
+    streaming: bool = True
+    chunk_duration: float = 2.0
+    max_window: float = 30.0  # Max seconds of audio in sliding window
 
 
 @dataclass
@@ -112,9 +113,10 @@ def save_default_config() -> None:
 model = "base"           # tiny, base, small, medium, large-v3
 device = "auto"          # auto, cuda, cpu
 compute_type = "auto"    # auto, float16, int8, float32
-language = "en"          # English only (optimized)
-streaming = true         # Continuous streaming transcription
-chunk_duration = 2.0     # Seconds per chunk for streaming
+language = "en"
+streaming = true
+chunk_duration = 2.0     # Seconds per chunk
+max_window = 30.0        # Max seconds in sliding window
 
 [audio]
 sample_rate = 16000

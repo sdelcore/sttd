@@ -36,15 +36,10 @@ class Transcriber:
         if self.config.device != "auto":
             return self.config.device
 
-        # Auto-detect: try CUDA first, fall back to CPU
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                logger.info("CUDA available, using GPU")
-                return "cuda"
-        except ImportError:
-            pass
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() > 0:
+            logger.info("CUDA available, using GPU")
+            return "cuda"
 
         logger.info("Using CPU for transcription")
         return "cpu"
@@ -115,12 +110,18 @@ class Transcriber:
 
         return " ".join(text_parts)
 
-    def transcribe_audio(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
+    def transcribe_audio(
+        self,
+        audio: np.ndarray,
+        sample_rate: int = 16000,
+        initial_prompt: str | None = None,
+    ) -> str:
         """Transcribe audio from a numpy array.
 
         Args:
             audio: Audio data as a numpy array (float32, mono).
             sample_rate: Sample rate of the audio (default: 16000).
+            initial_prompt: Optional context from previous transcription.
 
         Returns:
             The transcribed text.
@@ -133,6 +134,7 @@ class Transcriber:
             language=self.config.language,
             beam_size=5,
             vad_filter=True,
+            initial_prompt=initial_prompt,
         )
 
         logger.info(
