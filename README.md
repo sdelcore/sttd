@@ -147,6 +147,73 @@ min_segment_duration = 0.5  # Min segment length for identification
 sttd devices
 ```
 
+## Library Usage
+
+sttd can be used as a Python library in your own projects:
+
+```bash
+pip install sttd
+```
+
+### Basic Transcription
+
+```python
+from sttd import Transcriber, TranscriptionConfig
+
+# Use defaults (base model, auto device detection)
+transcriber = Transcriber()
+text = transcriber.transcribe_file("audio.wav")
+print(text)
+
+# Or with custom config
+config = TranscriptionConfig(model="large-v3", device="cuda", language="en")
+transcriber = Transcriber(config)
+text = transcriber.transcribe_file("audio.wav")
+```
+
+### Transcribe with Timestamps
+
+```python
+from sttd import Transcriber
+
+transcriber = Transcriber()
+segments = transcriber.transcribe_file_with_segments("audio.wav")
+
+for start, end, text in segments:
+    print(f"[{start:.2f}-{end:.2f}] {text}")
+```
+
+### Speaker Identification
+
+```python
+from sttd import Transcriber, SpeakerIdentifier, ProfileManager
+
+# First, transcribe with segments
+transcriber = Transcriber()
+segments = transcriber.transcribe_file_with_segments("meeting.wav")
+
+# Then identify speakers
+identifier = SpeakerIdentifier()
+profiles = ProfileManager().load_all()
+identified = identifier.identify_segments("meeting.wav", segments, profiles)
+
+for seg in identified:
+    print(f"[{seg.start:.1f}-{seg.end:.1f}] {seg.speaker}: {seg.text}")
+```
+
+### Audio Recording
+
+```python
+from sttd import Recorder, AudioConfig
+
+config = AudioConfig(sample_rate=16000, channels=1)
+recorder = Recorder(config)
+
+recorder.start()
+# ... recording ...
+audio = recorder.stop()  # Returns numpy array
+```
+
 ## Models
 
 Available Whisper models (via faster-whisper):
