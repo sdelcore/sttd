@@ -31,6 +31,11 @@
             dasbus
             pillow
             pygobject3
+            # Speaker identification dependencies
+            scipy
+            soundfile
+            speechbrain
+            torchaudio
           ];
 
           # Runtime dependencies
