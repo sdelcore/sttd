@@ -124,7 +124,10 @@ device = "auto"          # auto, cuda, cpu
 compute_type = "auto"    # auto, float16, int8, float32
 language = "en"
 streaming = true         # Real-time transcription
-chunk_duration = 2.0     # Seconds per streaming chunk
+chunk_duration = 1.0     # Seconds per streaming chunk
+max_window = 30.0        # Max seconds in sliding window
+beam_size = 1            # Beam size (1 = greedy for speed)
+context_words = 200      # Context preserved after buffer trim
 
 [audio]
 sample_rate = 16000

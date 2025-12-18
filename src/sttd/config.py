@@ -19,8 +19,10 @@ class TranscriptionConfig:
     compute_type: str = "auto"
     language: str = "en"
     streaming: bool = True
-    chunk_duration: float = 2.0
+    chunk_duration: float = 1.0  # Seconds per chunk (reduced from 2.0 for faster feedback)
     max_window: float = 30.0  # Max seconds of audio in sliding window
+    beam_size: int = 1  # Beam size for streaming (1 = greedy decoding for speed)
+    context_words: int = 200  # Words to keep as initial_prompt context after buffer trim
 
 
 @dataclass
@@ -139,8 +141,10 @@ device = "auto"          # auto, cuda, cpu
 compute_type = "auto"    # auto, float16, int8, float32
 language = "en"
 streaming = true
-chunk_duration = 2.0     # Seconds per chunk
+chunk_duration = 1.0     # Seconds per chunk
 max_window = 30.0        # Max seconds in sliding window
+beam_size = 1            # Beam size for streaming (1 = greedy for speed)
+context_words = 200      # Words to keep as context after buffer trim
 
 [audio]
 sample_rate = 16000
