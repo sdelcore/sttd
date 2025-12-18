@@ -183,6 +183,51 @@ class Transcriber:
 
         return " ".join(text_parts)
 
+    def transcribe_audio_with_words(
+        self,
+        audio: np.ndarray,
+        sample_rate: int = 16000,
+        initial_prompt: str | None = None,
+        beam_size: int = 1,
+    ) -> tuple[str, list[tuple[str, float, float, float]]]:
+        """Transcribe audio with word-level timestamps for streaming.
+
+        Args:
+            audio: Audio data as a numpy array (float32, mono).
+            sample_rate: Sample rate of the audio (default: 16000).
+            initial_prompt: Optional context from previous transcription.
+            beam_size: Beam size for decoding (1 = greedy, faster).
+
+        Returns:
+            Tuple of (full_text, list of (word, start, end, probability) tuples).
+        """
+        audio = self._normalize_audio(audio)
+        logger.debug(f"Transcribing with words: {len(audio)} samples at {sample_rate}Hz")
+
+        segments, info = self.model.transcribe(
+            audio,
+            language=self.config.language,
+            beam_size=beam_size,
+            word_timestamps=True,
+            vad_filter=False,  # We handle buffering externally for streaming
+            initial_prompt=initial_prompt,
+        )
+
+        logger.debug(
+            f"Detected language: {info.language} (probability: {info.language_probability:.2f})"
+        )
+
+        text_parts = []
+        all_words = []
+
+        for segment in segments:
+            text_parts.append(segment.text.strip())
+            if segment.words:
+                for word in segment.words:
+                    all_words.append((word.word, word.start, word.end, word.probability))
+
+        return " ".join(text_parts), all_words
+
     def transcribe_stream(
         self, audio: np.ndarray, sample_rate: int = 16000
     ) -> Generator[str, None, None]:

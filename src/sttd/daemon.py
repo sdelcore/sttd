@@ -12,7 +12,15 @@ import numpy as np
 
 from sttd import audio
 from sttd.config import Config, get_pid_path, load_config
-from sttd.injector import inject_backspaces, inject_text
+from sttd.injector import inject_text
+from sttd.local_agreement import (
+    LocalAgreementState,
+    TranscriptResult,
+    WordInfo,
+    find_agreed_prefix,
+    find_sentence_boundary,
+    trim_audio_buffer,
+)
 from sttd.recorder import Recorder
 from sttd.server import Server
 from sttd.transcriber import Transcriber
@@ -53,11 +61,8 @@ class Daemon:
         self._audio_chunk_queue: queue.Queue[np.ndarray | None] = queue.Queue()
         self._streaming_thread: threading.Thread | None = None
 
-        # Streaming transcription tracking
-        self._accumulated_audio: list[np.ndarray] = []
-        self._previous_text: str = ""
-        self._previous_text_len: int = 0
-        self._finalized_context: str = ""  # Context from chunks that fell off window
+        # LocalAgreement streaming state
+        self._la_state: LocalAgreementState | None = None
 
         # PID file
         self._pid_path = get_pid_path()
@@ -132,11 +137,8 @@ class Daemon:
                 except queue.Empty:
                     break
 
-            # Reset streaming transcription state
-            self._accumulated_audio = []
-            self._previous_text = ""
-            self._previous_text_len = 0
-            self._finalized_context = ""
+            # Initialize LocalAgreement state
+            self._la_state = LocalAgreementState()
 
             # Start streaming transcription thread
             self._streaming_thread = threading.Thread(
@@ -214,15 +216,19 @@ class Daemon:
         self._audio_chunk_queue.put(audio_data)
 
     def _streaming_transcribe(self) -> None:
-        """Background thread for streaming transcription with sliding window.
+        """Background thread for streaming transcription with LocalAgreement-2.
 
-        Uses a sliding window to keep memory bounded. When chunks fall off the
-        window, their text is preserved as context via initial_prompt.
+        Uses the LocalAgreement algorithm to only emit text when consecutive
+        transcription iterations agree on a prefix. This eliminates flickering
+        and provides stable, append-only text output.
         """
-        logger.info("Streaming transcription thread started")
-        max_chunks = int(
-            self.config.transcription.max_window / self.config.transcription.chunk_duration
-        )
+        logger.info("LocalAgreement streaming transcription started")
+
+        if self._la_state is None:
+            logger.error("LocalAgreement state not initialized")
+            return
+
+        state = self._la_state
 
         while self._state == DaemonState.RECORDING:
             try:
@@ -231,46 +237,117 @@ class Daemon:
                 if chunk is None:
                     break
 
-                self._accumulated_audio.append(chunk)
-
-                # Sliding window: trim oldest chunks, preserve text as context
-                while len(self._accumulated_audio) > max_chunks:
-                    self._accumulated_audio.pop(0)
-                    if self._previous_text:
-                        self._finalized_context = self._previous_text
+                # Add chunk to buffer (deque automatically evicts old chunks)
+                state.audio_buffer.append(chunk)
 
                 if self._transcriber is None:
                     self._transcriber = Transcriber(self.config.transcription)
 
-                full_audio = np.concatenate(self._accumulated_audio)
-                new_text = self._transcriber.transcribe_audio(
+                # Need at least some audio to transcribe
+                if len(state.audio_buffer) == 0:
+                    continue
+
+                # Transcribe with word timestamps
+                full_audio = np.concatenate(list(state.audio_buffer))
+                text, words = self._transcriber.transcribe_audio_with_words(
                     full_audio,
                     sample_rate=self.config.audio.sample_rate,
-                    initial_prompt=self._finalized_context or None,
+                    initial_prompt=state.context_text or None,
+                    beam_size=self.config.transcription.beam_size,
                 )
 
-                if new_text:
-                    new_text = new_text.strip()
+                if not words:
+                    continue
 
-                if new_text and new_text != self._previous_text:
-                    logger.info(
-                        f"Streaming ({len(self._accumulated_audio)} chunks): {new_text[:50]}..."
-                    )
+                # Build TranscriptResult
+                result = TranscriptResult(
+                    words=[WordInfo(*w) for w in words],
+                    text=text,
+                )
 
-                    if self._previous_text_len > 0:
-                        inject_backspaces(self._previous_text_len)
+                # LocalAgreement-2: compare with previous transcription
+                if state.prev_result is not None:
+                    agreed = find_agreed_prefix(state.prev_result, result)
 
-                    inject_text(new_text, self.config.output.method)
+                    # Check for newly confirmed words
+                    new_confirmed_count = len(agreed) - state.confirmed_word_count
 
-                    self._previous_text = new_text
-                    self._previous_text_len = len(new_text)
+                    if new_confirmed_count > 0:
+                        # Get the newly confirmed words
+                        new_words = agreed[state.confirmed_word_count :]
+
+                        # Build text to inject
+                        new_text = "".join(w.word for w in new_words)
+
+                        logger.info(
+                            f"Confirmed ({len(state.audio_buffer)} chunks): "
+                            f"'{new_text[:50]}...' ({new_confirmed_count} words)"
+                        )
+
+                        # Inject only newly confirmed text (append-only)
+                        inject_text(new_text, self.config.output.method)
+
+                        state.confirmed_word_count = len(agreed)
+                        state.confirmed_text += new_text
+
+                        # Check for sentence boundary to trim buffer
+                        trim_info = find_sentence_boundary(agreed)
+                        if trim_info is not None:
+                            logger.debug(f"Trimming buffer at {trim_info.audio_timestamp:.2f}s")
+                            trim_audio_buffer(
+                                state,
+                                trim_info,
+                                sample_rate=self.config.audio.sample_rate,
+                                chunk_duration=self.config.transcription.chunk_duration,
+                                context_words_limit=self.config.transcription.context_words,
+                            )
+
+                # Store for next comparison
+                state.prev_result = result
 
             except queue.Empty:
                 continue
             except Exception as e:
                 logger.warning(f"Streaming transcription error: {e}")
 
-        logger.info("Streaming transcription thread stopped")
+        # Finalize: emit any remaining unconfirmed text
+        self._finalize_streaming(state)
+        logger.info("LocalAgreement streaming transcription stopped")
+
+    def _finalize_streaming(self, state: LocalAgreementState) -> None:
+        """Finalize streaming transcription, emitting any remaining text.
+
+        When recording stops, we do a final transcription and emit any
+        unconfirmed words since no more updates are coming.
+        """
+        if not state.audio_buffer:
+            return
+
+        try:
+            if self._transcriber is None:
+                return
+
+            # Do final transcription
+            full_audio = np.concatenate(list(state.audio_buffer))
+            text, words = self._transcriber.transcribe_audio_with_words(
+                full_audio,
+                sample_rate=self.config.audio.sample_rate,
+                initial_prompt=state.context_text or None,
+                beam_size=self.config.transcription.beam_size,
+            )
+
+            if not words:
+                return
+
+            # Emit any remaining words beyond what was confirmed
+            remaining_words = words[state.confirmed_word_count :]
+            if remaining_words:
+                remaining_text = "".join(w[0] for w in remaining_words)
+                logger.info(f"Finalizing unconfirmed text: '{remaining_text[:50]}...'")
+                inject_text(remaining_text, self.config.output.method)
+
+        except Exception as e:
+            logger.warning(f"Error finalizing streaming: {e}")
 
     def _transcribe_and_inject(self, audio_data: np.ndarray) -> None:
         """Transcribe audio and inject text (batch mode)."""
