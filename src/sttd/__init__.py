@@ -40,8 +40,10 @@ from sttd.diarizer import (
     ENROLLMENT_PROMPT,
     DiarizedSegment,
     IdentifiedSegment,
+    SpeakerDiarizer,
     SpeakerEmbedder,
     SpeakerIdentifier,
+    align_transcription_with_diarization,
 )
 
 # Voice profiles
@@ -63,10 +65,12 @@ __all__ = [
     # Speaker identification
     "SpeakerEmbedder",
     "SpeakerIdentifier",
+    "SpeakerDiarizer",
     "IdentifiedSegment",
     "DiarizedSegment",
     "DiarizationConfig",
     "ENROLLMENT_PROMPT",
+    "align_transcription_with_diarization",
     # Profiles
     "VoiceProfile",
     "ProfileManager",
