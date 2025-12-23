@@ -37,6 +37,7 @@
             speechbrain
             huggingface-hub
             requests
+            scikit-learn
           ];
 
           # Runtime dependencies
