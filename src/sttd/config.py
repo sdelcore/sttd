@@ -43,12 +43,30 @@ class DiarizationConfig:
 
 
 @dataclass
+class ServerConfig:
+    """HTTP server settings."""
+
+    host: str = "127.0.0.1"
+    port: int = 8765
+
+
+@dataclass
+class ClientConfig:
+    """HTTP client settings."""
+
+    server_url: str = "http://127.0.0.1:8765"
+    timeout: float = 60.0
+
+
+@dataclass
 class Config:
     """Main configuration container."""
 
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
     diarization: DiarizationConfig = field(default_factory=DiarizationConfig)
+    server: ServerConfig = field(default_factory=ServerConfig)
+    client: ClientConfig = field(default_factory=ClientConfig)
 
 
 def get_config_path() -> Path:
@@ -110,7 +128,30 @@ def load_config() -> Config:
             if hasattr(config.diarization, key):
                 setattr(config.diarization, key, value)
 
+    if "server" in data:
+        for key, value in data["server"].items():
+            if hasattr(config.server, key):
+                setattr(config.server, key, value)
+
+    if "client" in data:
+        for key, value in data["client"].items():
+            if hasattr(config.client, key):
+                setattr(config.client, key, value)
+
     return config
+
+
+def get_server_url(cli_url: str | None = None) -> str:
+    """Get the server URL from CLI, env, or config (in priority order)."""
+    if cli_url:
+        return cli_url
+
+    env_url = os.environ.get("STTD_SERVER_URL")
+    if env_url:
+        return env_url
+
+    config = load_config()
+    return config.client.server_url
 
 
 def save_default_config() -> None:
@@ -138,6 +179,14 @@ min_segment_duration = 0.5  # Minimum segment length for embedding (seconds)
 # model = "speechbrain/spkrec-ecapa-voxceleb"  # SpeechBrain embedding model
 # num_speakers = 2       # Set if known, leave unset for auto-detect
 # clustering_threshold = 0.7  # Clustering threshold when num_speakers is None
+
+[server]
+host = "127.0.0.1"       # 0.0.0.0 to accept remote connections
+port = 8765
+
+[client]
+server_url = "http://127.0.0.1:8765"
+timeout = 60.0           # Request timeout in seconds
 """
     with open(config_path, "w") as f:
         f.write(default_config)

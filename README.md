@@ -1,18 +1,20 @@
 # sttd - Speech-to-Text Daemon
 
-A speech-to-text daemon for Linux/Wayland, optimized for Hyprland. Bind a hotkey to toggle recording, and transcribed text is automatically typed at your cursor.
+A speech-to-text daemon for Linux/Wayland, optimized for Hyprland. Bind a hotkey to toggle recording, and transcribed text is copied to your clipboard.
 
 ## Features
 
-- Real-time streaming transcription
 - Hotkey toggle - bind `sttd toggle` to any key
+- Record-then-transcribe workflow
+- **Client-server mode** - run transcription on a remote GPU server
 - System tray integration
 - GPU acceleration with CPU fallback
 - Multiple Whisper models (tiny to large-v3)
 - Audio feedback on start/stop
-- Text injection via wtype with clipboard fallback
-- File transcription
-- Speaker diarization with profile matching
+- Clipboard text injection
+- File transcription with timestamps
+- Speaker diarization with spectral clustering
+- Voice profile matching for speaker identification
 
 ## Installation
 
@@ -67,11 +69,51 @@ Stop the daemon:
 sttd stop
 ```
 
+### Client-Server Mode
+
+Run transcription on a powerful remote machine (GPU server) while recording locally on an underpowered client.
+
+**On the server (GPU machine):**
+```bash
+sttd server                     # Local only (127.0.0.1:8765)
+sttd server --host 0.0.0.0      # Accept remote connections
+sttd server --port 9000         # Custom port
+sttd server -d                  # Run in background
+```
+
+**On the client:**
+```bash
+sttd client --server http://192.168.1.100:8765
+sttd client -d                  # Run in background
+
+# Or set server URL via environment
+STTD_SERVER_URL=http://server:8765 sttd client
+```
+
+The client records audio locally, sends it to the server for transcription, and copies the result to clipboard.
+
+**Test with curl:**
+```bash
+curl -X POST -H "Content-Type: audio/wav" \
+  --data-binary @audio.wav \
+  http://localhost:8765/transcribe
+```
+
 ### Hyprland Configuration
 
 Add to `~/.config/hypr/hyprland.conf`:
 ```
 bind = SUPER, R, exec, sttd toggle
+```
+
+### Record and Transcribe
+
+Record from microphone and transcribe with timestamps:
+```bash
+sttd record                         # Record until Ctrl+C, output timestamps
+sttd record -o transcript.txt       # Save to file
+sttd record --annotate              # With speaker diarization
+sttd record --annotate --num-speakers 2
 ```
 
 ### File Transcription
@@ -81,6 +123,7 @@ Transcribe an audio file:
 sttd transcribe audio.wav                    # Output to stdout
 sttd transcribe audio.mp3 -o transcript.txt  # Output to file
 sttd transcribe audio.wav --model large-v3   # Use a specific model
+sttd transcribe meeting.wav --annotate --num-speakers 3  # With diarization
 ```
 
 ### Speaker Identification
@@ -123,11 +166,6 @@ model = "base"           # tiny, base, small, medium, large-v3
 device = "auto"          # auto, cuda, cpu
 compute_type = "auto"    # auto, float16, int8, float32
 language = "en"
-streaming = true         # Real-time transcription
-chunk_duration = 1.0     # Seconds per streaming chunk
-max_window = 30.0        # Max seconds in sliding window
-beam_size = 1            # Beam size (1 = greedy for speed)
-context_words = 200      # Context preserved after buffer trim
 
 [audio]
 sample_rate = 16000
@@ -135,13 +173,20 @@ channels = 1
 device = "default"
 beep_enabled = true
 
-[output]
-method = "wtype"         # wtype, clipboard, both
-
 [diarization]
 device = "auto"          # auto, cuda, cpu
-similarity_threshold = 0.5  # Speaker matching threshold (0-1)
-min_segment_duration = 0.5  # Min segment length for identification
+similarity_threshold = 0.5  # Profile matching threshold (0-1)
+min_segment_duration = 0.5  # Min segment length for embedding
+# num_speakers = 2       # Set if known, leave unset for auto-detect
+# clustering_threshold = 0.7  # Threshold when num_speakers is None
+
+[server]
+host = "127.0.0.1"       # 0.0.0.0 to accept remote connections
+port = 8765
+
+[client]
+server_url = "http://127.0.0.1:8765"
+timeout = 60.0           # Request timeout in seconds
 ```
 
 ### List Audio Devices
@@ -186,7 +231,26 @@ for start, end, text in segments:
     print(f"[{start:.2f}-{end:.2f}] {text}")
 ```
 
-### Speaker Identification
+### Speaker Diarization
+
+```python
+from sttd import Transcriber, SpeakerDiarizer, align_transcription_with_diarization
+
+transcriber = Transcriber()
+diarizer = SpeakerDiarizer()
+
+# Get transcription segments and speaker segments
+segments = transcriber.transcribe_file_with_segments("meeting.wav")
+speaker_segments = diarizer.diarize("meeting.wav", num_speakers=2)
+
+# Align transcription with speaker labels
+aligned = align_transcription_with_diarization(segments, speaker_segments)
+
+for seg in aligned:
+    print(f"[{seg.start:.1f}-{seg.end:.1f}] {seg.speaker}: {seg.text}")
+```
+
+### Speaker Identification with Profiles
 
 ```python
 from sttd import Transcriber, SpeakerIdentifier, ProfileManager
@@ -195,7 +259,7 @@ from sttd import Transcriber, SpeakerIdentifier, ProfileManager
 transcriber = Transcriber()
 segments = transcriber.transcribe_file_with_segments("meeting.wav")
 
-# Then identify speakers
+# Then identify speakers using registered voice profiles
 identifier = SpeakerIdentifier()
 profiles = ProfileManager().load_all()
 identified = identifier.identify_segments("meeting.wav", segments, profiles)
@@ -231,15 +295,30 @@ Available Whisper models (via faster-whisper):
 
 ## Architecture
 
+**Local mode** (`sttd start`):
 ```
 CLI (sttd toggle) → Unix Socket → Daemon
                                     ├── Recorder (sounddevice)
                                     ├── Transcriber (faster-whisper)
-                                    ├── Injector (wtype/wl-clipboard)
+                                    ├── Injector (wl-clipboard)
                                     └── Tray Icon (D-Bus SNI)
+```
 
-CLI (sttd transcribe --annotate) → Transcriber → SpeakerIdentifier
-                                                   └── SpeechBrain ECAPA-TDNN
+**Client-server mode** (`sttd server` + `sttd client`):
+```
+Client Machine                       Server Machine (GPU)
+─────────────────                    ────────────────────
+sttd client                          sttd server
+  ├── Recorder ──── WAV ──── HTTP POST /transcribe ────→ Transcriber
+  ├── Tray Icon                                              │
+  └── Injector ←──── text ←───────────────────────────────────
+```
+
+**File transcription with diarization:**
+```
+CLI (sttd transcribe/record --annotate) → Transcriber → SpeakerDiarizer
+                                                          └── SpeechBrain ECAPA-TDNN
+                                                          └── Spectral Clustering
 ```
 
 ## License
