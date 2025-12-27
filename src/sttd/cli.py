@@ -76,6 +76,117 @@ def start(ctx: click.Context, daemon: bool) -> None:
 
 
 @main.command()
+@click.option("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+@click.option("--port", default=None, type=int, help="Port to bind to (default: 8765)")
+@click.option("--daemon", "-d", is_flag=True, help="Run in background")
+@click.pass_context
+def server(ctx: click.Context, host: str | None, port: int | None, daemon: bool) -> None:
+    """Start the transcription HTTP server.
+
+    The server accepts audio via HTTP POST and returns transcribed text.
+    Bind to 0.0.0.0 to accept connections from other machines.
+
+    Examples:
+
+        sttd server                     # Local only
+
+        sttd server --host 0.0.0.0      # Network accessible
+
+        sttd server --port 9000         # Custom port
+
+        sttd server -d                  # Run in background
+    """
+    import signal
+
+    from sttd.daemon import daemonize
+    from sttd.http_server import TranscriptionServer
+
+    config = load_config()
+
+    effective_host = host or config.server.host
+    effective_port = port or config.server.port
+
+    click.echo(f"Starting transcription server on {effective_host}:{effective_port}")
+    click.echo(f"Model: {config.transcription.model}")
+
+    if daemon:
+        click.echo("Daemonizing...")
+        daemonize()
+
+    srv = TranscriptionServer(host=effective_host, port=effective_port, config=config)
+
+    def handle_sigterm(signum, frame):
+        click.echo("\nShutting down server...")
+        srv.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGINT, handle_sigterm)
+
+    try:
+        srv.start()
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+
+@main.command("client")
+@click.option(
+    "--server", "server_url", default=None, help="Server URL (e.g., http://192.168.1.100:8765)"
+)
+@click.option("--daemon", "-d", is_flag=True, help="Run in background")
+@click.option("--timeout", type=float, default=None, help="Request timeout in seconds")
+@click.pass_context
+def client_cmd(
+    ctx: click.Context, server_url: str | None, daemon: bool, timeout: float | None
+) -> None:
+    """Start the remote client daemon.
+
+    Records audio locally and sends to a remote server for transcription.
+    The server URL can be set via CLI, environment variable (STTD_SERVER_URL),
+    or config file.
+
+    Examples:
+
+        sttd client --server http://192.168.1.100:8765
+
+        sttd client -d                  # Run in background
+
+        STTD_SERVER_URL=http://server:8765 sttd client
+    """
+    from sttd.config import get_server_url
+    from sttd.daemon import daemonize
+    from sttd.remote_daemon import RemoteDaemon, is_client_running
+
+    if is_client_running():
+        click.echo("Client is already running", err=True)
+        sys.exit(1)
+
+    config = load_config()
+    effective_url = get_server_url(server_url)
+
+    click.echo("Starting remote client")
+    click.echo(f"Server: {effective_url}")
+
+    if daemon:
+        click.echo("Daemonizing...")
+        daemonize()
+
+    try:
+        client = RemoteDaemon(
+            server_url=effective_url,
+            config=config,
+            timeout=timeout,
+        )
+        client.run()
+    except KeyboardInterrupt:
+        click.echo("\nClient interrupted")
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+
+@main.command()
 def stop() -> None:
     """Stop the sttd daemon."""
     from sttd import client
