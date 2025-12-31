@@ -224,10 +224,17 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
                 wav_path = temp_path.rsplit(".", 1)[0] + ".wav"
                 result = subprocess.run(
                     [
-                        "ffmpeg", "-y", "-i", temp_path,
-                        "-ar", "16000",  # Resample to 16kHz (optimal for Whisper)
-                        "-ac", "1",      # Convert to mono
-                        "-f", "wav", wav_path
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        temp_path,
+                        "-ar",
+                        "16000",  # Resample to 16kHz (optimal for Whisper)
+                        "-ac",
+                        "1",  # Convert to mono
+                        "-f",
+                        "wav",
+                        wav_path,
                     ],
                     capture_output=True,
                     check=True,
@@ -244,7 +251,9 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
 
         except subprocess.CalledProcessError as e:
             logger.error(f"FFmpeg conversion failed: {e.stderr.decode()}")
-            self._send_error_json(400, f"Failed to convert audio: {e.stderr.decode()}", "INVALID_AUDIO")
+            self._send_error_json(
+                400, f"Failed to convert audio: {e.stderr.decode()}", "INVALID_AUDIO"
+            )
             return
         except Exception as e:
             logger.error(f"Failed to read audio: {e}")
@@ -288,44 +297,52 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
                             profiles,
                         )
                         for seg in identified:
-                            segments_output.append({
-                                "start": round(seg.start, 2),
-                                "end": round(seg.end, 2),
-                                "text": seg.text,
-                                "speaker": seg.speaker,
-                                "speaker_confidence": round(seg.confidence, 2),
-                            })
+                            segments_output.append(
+                                {
+                                    "start": round(seg.start, 2),
+                                    "end": round(seg.end, 2),
+                                    "text": seg.text,
+                                    "speaker": seg.speaker,
+                                    "speaker_confidence": round(seg.confidence, 2),
+                                }
+                            )
                     else:
                         # No profiles, return segments without speaker info
                         for start, end, text in segments_raw:
-                            segments_output.append({
+                            segments_output.append(
+                                {
+                                    "start": round(start, 2),
+                                    "end": round(end, 2),
+                                    "text": text,
+                                    "speaker": "Unknown",
+                                    "speaker_confidence": 0.0,
+                                }
+                            )
+                except Exception as e:
+                    logger.warning(f"Speaker identification failed: {e}")
+                    # Fall back to segments without speaker info
+                    for start, end, text in segments_raw:
+                        segments_output.append(
+                            {
                                 "start": round(start, 2),
                                 "end": round(end, 2),
                                 "text": text,
                                 "speaker": "Unknown",
                                 "speaker_confidence": 0.0,
-                            })
-                except Exception as e:
-                    logger.warning(f"Speaker identification failed: {e}")
-                    # Fall back to segments without speaker info
-                    for start, end, text in segments_raw:
-                        segments_output.append({
+                            }
+                        )
+            else:
+                # No speaker identification, return segments without speaker info
+                for start, end, text in segments_raw:
+                    segments_output.append(
+                        {
                             "start": round(start, 2),
                             "end": round(end, 2),
                             "text": text,
                             "speaker": "Unknown",
                             "speaker_confidence": 0.0,
-                        })
-            else:
-                # No speaker identification, return segments without speaker info
-                for start, end, text in segments_raw:
-                    segments_output.append({
-                        "start": round(start, 2),
-                        "end": round(end, 2),
-                        "text": text,
-                        "speaker": "Unknown",
-                        "speaker_confidence": 0.0,
-                    })
+                        }
+                    )
 
             elapsed = time.time() - start_time
 
@@ -382,11 +399,13 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
 
             profiles_data = []
             for p in profiles:
-                profiles_data.append({
-                    "name": p.name,
-                    "created_at": p.created_at,
-                    "audio_duration": p.audio_duration,
-                })
+                profiles_data.append(
+                    {
+                        "name": p.name,
+                        "created_at": p.created_at,
+                        "audio_duration": p.audio_duration,
+                    }
+                )
 
             self._send_json(200, {"profiles": profiles_data})
         except Exception as e:
@@ -403,12 +422,15 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
                 self._send_error_json(404, f"Profile '{name}' not found", "PROFILE_NOT_FOUND")
                 return
 
-            self._send_json(200, {
-                "name": profile.name,
-                "created_at": profile.created_at,
-                "audio_duration": profile.audio_duration,
-                "model_version": profile.model_version,
-            })
+            self._send_json(
+                200,
+                {
+                    "name": profile.name,
+                    "created_at": profile.created_at,
+                    "audio_duration": profile.audio_duration,
+                    "model_version": profile.model_version,
+                },
+            )
         except Exception as e:
             logger.exception(f"Failed to get profile: {e}")
             self._send_error_json(500, f"Failed to get profile: {e}", "PROFILE_ERROR")
@@ -460,12 +482,15 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
             profile_manager = self._get_profile_manager()
             profile_manager.save(profile)
 
-            self._send_json(201, {
-                "status": "created",
-                "name": name,
-                "audio_duration": round(duration, 1),
-                "model_version": embedder.model_source,
-            })
+            self._send_json(
+                201,
+                {
+                    "status": "created",
+                    "name": name,
+                    "audio_duration": round(duration, 1),
+                    "model_version": embedder.model_source,
+                },
+            )
         except Exception as e:
             logger.exception(f"Failed to create profile: {e}")
             self._send_error_json(500, f"Failed to create profile: {e}", "PROFILE_ERROR")

@@ -48,9 +48,32 @@ def main(ctx: click.Context, verbose: bool) -> None:
 
 @main.command()
 @click.option("--daemon", "-d", is_flag=True, help="Run in background (daemonize)")
+@click.option("--http", is_flag=True, help="Enable embedded HTTP server for remote transcription")
+@click.option("--http-host", default=None, help="HTTP server host (default: from config)")
+@click.option("--http-port", default=None, type=int, help="HTTP server port (default: from config)")
 @click.pass_context
-def start(ctx: click.Context, daemon: bool) -> None:
-    """Start the sttd daemon."""
+def start(
+    ctx: click.Context,
+    daemon: bool,
+    http: bool,
+    http_host: str | None,
+    http_port: int | None,
+) -> None:
+    """Start the sttd daemon.
+
+    The daemon provides hotkey-triggered recording with tray icon.
+    Use --http to also enable the HTTP transcription API.
+
+    Examples:
+
+        sttd start                      # Desktop mode only
+
+        sttd start --http               # Desktop + HTTP API
+
+        sttd start --http --http-host 0.0.0.0  # Accept remote connections
+
+        sttd start -d                   # Run in background
+    """
     from sttd.daemon import Daemon, daemonize, is_daemon_running
 
     if is_daemon_running():
@@ -59,14 +82,26 @@ def start(ctx: click.Context, daemon: bool) -> None:
 
     config = load_config()
 
+    # Determine effective HTTP settings
+    http_enabled = http or config.daemon.http_enabled
+
     click.echo(f"Starting sttd daemon (model: {config.transcription.model})")
+    if http_enabled:
+        effective_host = http_host or config.daemon.http_host or config.server.host
+        effective_port = http_port or config.daemon.http_port or config.server.port
+        click.echo(f"HTTP server: {effective_host}:{effective_port}")
 
     if daemon:
         click.echo("Daemonizing...")
         daemonize()
 
     try:
-        d = Daemon(config)
+        d = Daemon(
+            config,
+            http_enabled=http if http else None,  # Only override if explicitly set
+            http_host=http_host,
+            http_port=http_port,
+        )
         d.run()
     except KeyboardInterrupt:
         click.echo("\nDaemon interrupted")
@@ -260,10 +295,10 @@ def status() -> None:
 @click.option("--device", default=None, help="Device to use: auto, cuda, cpu")
 @click.option("--annotate", is_flag=True, help="Enable timestamps and speaker diarization")
 @click.option("--num-speakers", type=int, default=None, help="Number of speakers (auto if unset)")
+@click.option("--server", "server_url", default=None, help="Server URL for remote transcription")
 @click.option(
-    "--server", "server_url", default=None, help="Server URL for remote transcription"
+    "--timeout", type=float, default=300.0, help="Request timeout in seconds (default: 300)"
 )
-@click.option("--timeout", type=float, default=300.0, help="Request timeout in seconds (default: 300)")
 def transcribe(
     audio_file: Path,
     output: Path | None,
@@ -715,10 +750,10 @@ def config(show: bool, init: bool, model: str | None, device: str | None) -> Non
 )
 @click.option("--device", default=None, help="Device: auto, cuda, cpu")
 @click.option("--force", is_flag=True, help="Overwrite existing profile")
+@click.option("--server", "server_url", default=None, help="Server URL for remote registration")
 @click.option(
-    "--server", "server_url", default=None, help="Server URL for remote registration"
+    "--timeout", type=float, default=60.0, help="Request timeout in seconds (default: 60)"
 )
-@click.option("--timeout", type=float, default=60.0, help="Request timeout in seconds (default: 60)")
 def register(
     name: str,
     audio_file: Path | None,
@@ -761,7 +796,9 @@ def register(
 
         pm = ProfileManager()
         if pm.exists(name) and not force:
-            click.echo(f"Error: Profile '{name}' already exists. Use --force to overwrite.", err=True)
+            click.echo(
+                f"Error: Profile '{name}' already exists. Use --force to overwrite.", err=True
+            )
             sys.exit(1)
 
     if record:

@@ -68,11 +68,28 @@ Stop the daemon:
 sttd stop
 ```
 
-### Client-Server Mode
+### Daemon with HTTP API
 
-Run transcription on a powerful remote machine (GPU server) while recording locally on an underpowered client.
+The daemon can also expose an HTTP API for remote transcription requests. This allows a single process to handle both hotkey-triggered recording and HTTP API requests, sharing one model instance:
 
-**On the server (GPU machine):**
+```bash
+sttd start --http                      # Enable HTTP API on 127.0.0.1:8765
+sttd start --http --http-host 0.0.0.0  # Accept remote connections
+sttd start --http --http-port 9000     # Custom port
+```
+
+Or enable via config (`~/.config/sttd/config.toml`):
+```toml
+[daemon]
+http_enabled = true
+http_host = "0.0.0.0"
+http_port = 8765
+```
+
+### Standalone HTTP Server
+
+For headless deployments without a display (e.g., dedicated GPU server):
+
 ```bash
 sttd server                     # Local only (127.0.0.1:8765)
 sttd server --host 0.0.0.0      # Accept remote connections
@@ -80,7 +97,10 @@ sttd server --port 9000         # Custom port
 sttd server -d                  # Run in background
 ```
 
-**On the client:**
+### Remote Client
+
+Record locally on an underpowered client, send to a remote server for transcription:
+
 ```bash
 sttd client --server http://192.168.1.100:8765
 sttd client -d                  # Run in background
@@ -178,6 +198,11 @@ similarity_threshold = 0.5  # Profile matching threshold (0-1)
 min_segment_duration = 0.5  # Min segment length for embedding
 # num_speakers = 2       # Set if known, leave unset for auto-detect
 # clustering_threshold = 0.7  # Threshold when num_speakers is None
+
+[daemon]
+http_enabled = false     # Start HTTP server alongside Unix socket
+# http_host = "0.0.0.0"  # Override server.host for daemon HTTP
+# http_port = 8765       # Override server.port for daemon HTTP
 
 [server]
 host = "127.0.0.1"       # 0.0.0.0 to accept remote connections
@@ -294,7 +319,7 @@ Available Whisper models (via faster-whisper):
 
 ## Architecture
 
-**Local mode** (`sttd start`):
+**Desktop mode** (`sttd start`):
 ```
 CLI (sttd toggle) → Unix Socket → Daemon
                                     ├── Recorder (sounddevice)
@@ -303,11 +328,28 @@ CLI (sttd toggle) → Unix Socket → Daemon
                                     └── Tray Icon (D-Bus SNI)
 ```
 
-**Client-server mode** (`sttd server` + `sttd client`):
+**Desktop + HTTP mode** (`sttd start --http`):
+```
+CLI (sttd toggle) → Unix Socket → Daemon
+                                    ├── Recorder (sounddevice)
+                                    ├── Transcriber (faster-whisper) ←─┐
+                                    ├── Injector (wl-clipboard)        │ shared
+                                    ├── Tray Icon (D-Bus SNI)          │
+                                    └── HTTP Server ───────────────────┘
+                                          ↑
+                HTTP POST /transcribe ────┘ (from other services)
+```
+
+**Headless server mode** (`sttd server`):
+```
+HTTP POST /transcribe → HTTP Server → Transcriber
+```
+
+**Remote client mode** (`sttd client`):
 ```
 Client Machine                       Server Machine (GPU)
 ─────────────────                    ────────────────────
-sttd client                          sttd server
+sttd client                          sttd server / sttd start --http
   ├── Recorder ──── WAV ──── HTTP POST /transcribe ────→ Transcriber
   ├── Tray Icon                                              │
   └── Injector ←──── text ←───────────────────────────────────

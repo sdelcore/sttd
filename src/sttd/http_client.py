@@ -214,9 +214,7 @@ class TranscriptionClient:
         except URLError as e:
             raise HttpConnectionError(f"Could not connect to server: {e.reason}")
 
-    def create_profile(
-        self, name: str, audio: np.ndarray, sample_rate: int = 16000
-    ) -> dict:
+    def create_profile(self, name: str, audio: np.ndarray, sample_rate: int = 16000) -> dict:
         """Create a voice profile from audio.
 
         Args:

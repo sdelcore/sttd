@@ -44,6 +44,15 @@ class DiarizationConfig:
 
 
 @dataclass
+class DaemonConfig:
+    """Daemon settings."""
+
+    http_enabled: bool = False  # Start HTTP server alongside Unix socket
+    http_host: str | None = None  # Override server.host for daemon (None = use server.host)
+    http_port: int | None = None  # Override server.port for daemon (None = use server.port)
+
+
+@dataclass
 class ServerConfig:
     """HTTP server settings."""
 
@@ -66,6 +75,7 @@ class Config:
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
     diarization: DiarizationConfig = field(default_factory=DiarizationConfig)
+    daemon: DaemonConfig = field(default_factory=DaemonConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     client: ClientConfig = field(default_factory=ClientConfig)
 
@@ -140,6 +150,11 @@ def load_config() -> Config:
             if hasattr(config.diarization, key):
                 setattr(config.diarization, key, value)
 
+    if "daemon" in data:
+        for key, value in data["daemon"].items():
+            if hasattr(config.daemon, key):
+                setattr(config.daemon, key, value)
+
     if "server" in data:
         for key, value in data["server"].items():
             if hasattr(config.server, key):
@@ -191,7 +206,12 @@ min_segment_duration = 0.5  # Minimum segment length for embedding (seconds)
 # model = "speechbrain/spkrec-ecapa-voxceleb"  # SpeechBrain embedding model
 # num_speakers = 2       # Set if known, leave unset for auto-detect
 # clustering_threshold = 0.7  # Clustering threshold when num_speakers is None
-# profiles_path = "/path/to/profiles"  # Custom profiles directory (default: ~/.config/sttd/profiles)
+# profiles_path = "/path/to/profiles"  # Custom profiles directory
+
+[daemon]
+http_enabled = false     # Start HTTP server alongside Unix socket
+# http_host = "0.0.0.0"  # Override server.host for daemon HTTP
+# http_port = 8765       # Override server.port for daemon HTTP
 
 [server]
 host = "127.0.0.1"       # 0.0.0.0 to accept remote connections

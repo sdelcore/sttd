@@ -19,6 +19,18 @@ from sttd.tray import TrayIcon, TrayState
 
 logger = logging.getLogger(__name__)
 
+# Lazy import to avoid loading HTTP server dependencies unless needed
+TranscriptionServer = None
+
+
+def _get_transcription_server():
+    """Lazy load TranscriptionServer to avoid import overhead."""
+    global TranscriptionServer
+    if TranscriptionServer is None:
+        from sttd.http_server import TranscriptionServer
+
+    return TranscriptionServer
+
 
 class DaemonState(Enum):
     """Daemon state."""
@@ -31,22 +43,53 @@ class DaemonState(Enum):
 class Daemon:
     """Main daemon process for speech-to-text."""
 
-    def __init__(self, config: Config | None = None):
+    def __init__(
+        self,
+        config: Config | None = None,
+        http_enabled: bool | None = None,
+        http_host: str | None = None,
+        http_port: int | None = None,
+    ):
         """Initialize the daemon.
 
         Args:
             config: Configuration. Uses defaults if not provided.
+            http_enabled: Enable HTTP server. Overrides config if provided.
+            http_host: HTTP server host. Overrides config if provided.
+            http_port: HTTP server port. Overrides config if provided.
         """
         self.config = config or load_config()
         self._state = DaemonState.IDLE
         self._running = False
         self._shutdown_event = threading.Event()
 
+        # HTTP server settings (CLI overrides config)
+        if http_enabled is not None:
+            self._http_enabled = http_enabled
+        else:
+            self._http_enabled = self.config.daemon.http_enabled
+
+        # Host/port priority: CLI arg > daemon config > server config
+        if http_host is not None:
+            self._http_host = http_host
+        elif self.config.daemon.http_host is not None:
+            self._http_host = self.config.daemon.http_host
+        else:
+            self._http_host = self.config.server.host
+
+        if http_port is not None:
+            self._http_port = http_port
+        elif self.config.daemon.http_port is not None:
+            self._http_port = self.config.daemon.http_port
+        else:
+            self._http_port = self.config.server.port
+
         # Components
         self._server: Server | None = None
         self._recorder: Recorder | None = None
         self._transcriber: Transcriber | None = None
         self._tray: TrayIcon | None = None
+        self._http_server = None  # TranscriptionServer instance
 
         # PID file
         self._pid_path = get_pid_path()
@@ -221,7 +264,7 @@ class Daemon:
         self._write_pid()
 
         try:
-            # Initialize server
+            # Initialize Unix socket server for local IPC
             self._server = Server()
             self._server.register_handler("toggle", self._handle_toggle)
             self._server.register_handler("status", self._handle_status)
@@ -242,6 +285,10 @@ class Daemon:
             _ = self._transcriber.model  # Trigger model load
             logger.info("Model loaded")
 
+            # Start HTTP server if enabled (shares transcriber with daemon)
+            if self._http_enabled:
+                self._start_http_server()
+
             self._running = True
             logger.info("Daemon ready")
 
@@ -255,10 +302,33 @@ class Daemon:
         finally:
             self._cleanup()
 
+    def _start_http_server(self) -> None:
+        """Start the embedded HTTP server in a background thread."""
+        server_class = _get_transcription_server()
+
+        # Create HTTP server that shares the transcriber instance
+        self._http_server = server_class(
+            host=self._http_host,
+            port=self._http_port,
+            config=self.config,
+        )
+
+        # Share the already-loaded transcriber to avoid loading model twice
+        self._http_server.transcriber = self._transcriber
+
+        # Start in background thread (preload=False since model already loaded)
+        self._http_server.start_background(preload=False)
+        logger.info(f"HTTP server started on {self._http_host}:{self._http_port}")
+
     def _cleanup(self) -> None:
         """Clean up resources."""
         logger.info("Cleaning up")
         self._running = False
+
+        # Stop HTTP server first (it may be using the transcriber)
+        if self._http_server is not None:
+            self._http_server.stop()
+            self._http_server = None
 
         if self._server is not None:
             self._server.stop()
