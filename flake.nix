@@ -43,7 +43,7 @@
           # Runtime dependencies
           makeWrapperArgs = [
             "--prefix" "LD_LIBRARY_PATH" ":" "${pkgs.portaudio}/lib"
-            "--prefix" "PATH" ":" "${pkgs.lib.makeBinPath [ pkgs.wtype pkgs.wl-clipboard ]}"
+            "--prefix" "PATH" ":" "${pkgs.lib.makeBinPath [ pkgs.wtype pkgs.wl-clipboard pkgs.ffmpeg ]}"
             "--prefix" "GI_TYPELIB_PATH" ":" "${pkgs.glib.out}/lib/girepository-1.0:${pkgs.gobject-introspection}/lib/girepository-1.0"
           ];
 
