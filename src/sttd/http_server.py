@@ -190,14 +190,46 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
         identify_speakers = identify_speakers_param.lower() == "true"
         profiles_path = query_params.get("profiles_path", [None])[0]
 
-        wav_bytes = self.rfile.read(content_length)
+        audio_bytes = self.rfile.read(content_length)
 
+        # Use soundfile for robust audio format detection (supports WAV, WebM, MP3, OGG, etc.)
+        import os
+        import soundfile as sf
+
+        # Determine file extension from Content-Type header for better format detection
+        content_type = self.headers.get("Content-Type", "audio/wav")
+        ext_map = {
+            "audio/wav": ".wav",
+            "audio/webm": ".webm",
+            "audio/mpeg": ".mp3",
+            "audio/mp3": ".mp3",
+            "audio/ogg": ".ogg",
+            "audio/flac": ".flac",
+            "audio/mp4": ".m4a",
+            "audio/x-m4a": ".m4a",
+        }
+        suffix = ext_map.get(content_type, ".wav")
+
+        temp_path = None
         try:
-            audio, sample_rate = wav_to_audio(wav_bytes)
+            # Write to temp file for soundfile to read
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+                f.write(audio_bytes)
+                temp_path = f.name
+
+            audio, sample_rate = sf.read(temp_path, dtype="float32")
+
+            # Convert stereo to mono if needed
+            if len(audio.shape) > 1:
+                audio = audio.mean(axis=1)
+
         except Exception as e:
-            logger.error(f"Failed to parse WAV: {e}")
-            self._send_error_json(400, f"Invalid WAV format: {e}", "INVALID_AUDIO")
+            logger.error(f"Failed to read audio: {e}")
+            self._send_error_json(400, f"Failed to read audio file: {e}", "INVALID_AUDIO")
             return
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
         duration = len(audio) / sample_rate
         logger.info(f"Transcribing {duration:.1f}s of audio at {sample_rate}Hz")
