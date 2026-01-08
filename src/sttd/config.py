@@ -31,6 +31,17 @@ class AudioConfig:
 
 
 @dataclass
+class VadConfig:
+    """Voice Activity Detection settings for faster-whisper."""
+
+    enabled: bool = True  # Enable/disable VAD filtering
+    threshold: float = 0.5  # Speech probability (0.0-1.0, lower = more sensitive)
+    min_silence_duration_ms: int = 2000  # Silence duration to end speech segment
+    speech_pad_ms: int = 400  # Padding around detected speech
+    min_speech_duration_ms: int = 250  # Minimum speech segment duration
+
+
+@dataclass
 class DiarizationConfig:
     """Speaker diarization settings."""
 
@@ -74,6 +85,7 @@ class Config:
 
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
+    vad: VadConfig = field(default_factory=VadConfig)
     diarization: DiarizationConfig = field(default_factory=DiarizationConfig)
     daemon: DaemonConfig = field(default_factory=DaemonConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
@@ -145,6 +157,11 @@ def load_config() -> Config:
             if hasattr(config.audio, key):
                 setattr(config.audio, key, value)
 
+    if "vad" in data:
+        for key, value in data["vad"].items():
+            if hasattr(config.vad, key):
+                setattr(config.vad, key, value)
+
     if "diarization" in data:
         for key, value in data["diarization"].items():
             if hasattr(config.diarization, key):
@@ -198,6 +215,13 @@ sample_rate = 16000
 channels = 1
 device = "default"       # or specific device name
 beep_enabled = true      # audio feedback on start/stop
+
+[vad]
+enabled = true           # Enable voice activity detection
+threshold = 0.5          # Speech probability threshold (0.0-1.0, lower = more sensitive)
+min_silence_duration_ms = 2000  # Silence duration to end speech segment
+speech_pad_ms = 400      # Padding around detected speech
+min_speech_duration_ms = 250    # Minimum speech segment duration
 
 [diarization]
 device = "auto"          # auto, cuda, cpu

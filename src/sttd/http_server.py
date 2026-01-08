@@ -378,7 +378,7 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
             audio,
             language=self.transcriber.config.language,
             beam_size=5,
-            vad_filter=True,
+            **self.transcriber._get_vad_kwargs(),
         )
 
         logger.info(
@@ -526,7 +526,7 @@ class TranscriptionServer:
         self.config = config or load_config()
         self.host = host or self.config.server.host
         self.port = port or self.config.server.port
-        self.transcriber = Transcriber(self.config.transcription)
+        self.transcriber = Transcriber(self.config.transcription, vad_config=self.config.vad)
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._running = False

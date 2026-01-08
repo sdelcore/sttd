@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from faster_whisper import WhisperModel
 
-from sttd.config import TranscriptionConfig
+from sttd.config import TranscriptionConfig, VadConfig
 
 logger = logging.getLogger(__name__)
 
@@ -15,13 +15,19 @@ logger = logging.getLogger(__name__)
 class Transcriber:
     """Wrapper around faster-whisper for speech-to-text transcription."""
 
-    def __init__(self, config: TranscriptionConfig | None = None):
+    def __init__(
+        self,
+        config: TranscriptionConfig | None = None,
+        vad_config: VadConfig | None = None,
+    ):
         """Initialize the transcriber.
 
         Args:
             config: Transcription configuration. Uses defaults if not provided.
+            vad_config: VAD configuration. Uses defaults if not provided.
         """
         self.config = config or TranscriptionConfig()
+        self.vad_config = vad_config or VadConfig()
         self._model: WhisperModel | None = None
 
     @property
@@ -78,6 +84,21 @@ class Transcriber:
             audio = audio / 32768.0
         return audio
 
+    def _get_vad_kwargs(self) -> dict:
+        """Build VAD arguments for model.transcribe() based on config."""
+        if not self.vad_config.enabled:
+            return {"vad_filter": False}
+
+        return {
+            "vad_filter": True,
+            "vad_parameters": {
+                "threshold": self.vad_config.threshold,
+                "min_silence_duration_ms": self.vad_config.min_silence_duration_ms,
+                "speech_pad_ms": self.vad_config.speech_pad_ms,
+                "min_speech_duration_ms": self.vad_config.min_speech_duration_ms,
+            },
+        }
+
     def transcribe_file(self, audio_path: str | Path) -> str:
         """Transcribe an audio file.
 
@@ -97,7 +118,7 @@ class Transcriber:
             str(audio_path),
             language=self.config.language,
             beam_size=5,
-            vad_filter=True,
+            **self._get_vad_kwargs(),
         )
 
         logger.info(
@@ -132,7 +153,7 @@ class Transcriber:
             str(audio_path),
             language=self.config.language,
             beam_size=5,
-            vad_filter=True,
+            **self._get_vad_kwargs(),
         )
 
         logger.info(
@@ -166,7 +187,7 @@ class Transcriber:
             audio,
             language=self.config.language,
             beam_size=5,
-            vad_filter=True,
+            **self._get_vad_kwargs(),
         )
 
         logger.info(
@@ -202,8 +223,8 @@ class Transcriber:
             audio,
             language=self.config.language,
             beam_size=5,
-            vad_filter=True,
             initial_prompt=initial_prompt,
+            **self._get_vad_kwargs(),
         )
 
         logger.info(
@@ -243,8 +264,8 @@ class Transcriber:
             language=self.config.language,
             beam_size=beam_size,
             word_timestamps=True,
-            vad_filter=False,  # We handle buffering externally for streaming
             initial_prompt=initial_prompt,
+            **self._get_vad_kwargs(),
         )
 
         logger.debug(
@@ -279,7 +300,7 @@ class Transcriber:
             audio,
             language=self.config.language,
             beam_size=5,
-            vad_filter=True,
+            **self._get_vad_kwargs(),
         )
 
         for segment in segments:
