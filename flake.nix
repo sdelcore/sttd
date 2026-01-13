@@ -11,45 +11,108 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         python = pkgs.python312;
+
+        # Runtime dependencies
+        runtimeDeps = with pkgs; [
+          portaudio
+          ffmpeg
+          glib
+          gobject-introspection
+          cairo
+          wtype
+          wl-clipboard
+          stdenv.cc.cc.lib
+          cacert
+        ];
+
+        # Python with base packages that have native deps
+        pythonEnv = python.withPackages (ps: with ps; [
+          numpy
+          scipy
+          av
+          cryptography
+          pyopenssl
+          cffi
+          pygobject3
+          pycairo
+        ]);
+
+        # Source bundle for installation
+        voicedSrc = pkgs.stdenv.mkDerivation {
+          pname = "voiced-src";
+          version = "0.2.0";
+          src = ./.;
+          phases = [ "installPhase" ];
+          installPhase = ''
+            mkdir -p $out
+            cp -r $src/* $out/
+          '';
+        };
+
+        # Wrapper script that manages venv and installs from bundled source
+        voicedWrapper = pkgs.writeShellScriptBin "voiced" ''
+          set -e
+
+          VOICED_HOME="''${XDG_DATA_HOME:-$HOME/.local/share}/voiced"
+          VENV_DIR="$VOICED_HOME/venv"
+          VERSION_FILE="$VENV_DIR/.version"
+          CURRENT_VERSION="0.2.0"
+          SOURCE_DIR="${voicedSrc}"
+
+          export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath runtimeDeps}:''${LD_LIBRARY_PATH:-}"
+          export GI_TYPELIB_PATH="${pkgs.glib}/lib/girepository-1.0:${pkgs.gobject-introspection}/lib/girepository-1.0:''${GI_TYPELIB_PATH:-}"
+
+          # Add CUDA support if available
+          if [ -d /run/opengl-driver/lib ]; then
+            export LD_LIBRARY_PATH="/run/opengl-driver/lib:$LD_LIBRARY_PATH"
+          fi
+
+          # Check if venv needs to be created/updated
+          if [ ! -f "$VERSION_FILE" ] || [ "$(cat "$VERSION_FILE")" != "$CURRENT_VERSION" ]; then
+            echo "Setting up voiced v$CURRENT_VERSION..."
+            mkdir -p "$VOICED_HOME"
+            rm -rf "$VENV_DIR"
+
+            ${pkgs.uv}/bin/uv venv "$VENV_DIR" --python ${pythonEnv}/bin/python --seed
+            source "$VENV_DIR/bin/activate"
+
+            # Install voiced from bundled source
+            ${pkgs.uv}/bin/uv pip install "$SOURCE_DIR" --quiet
+
+            echo "$CURRENT_VERSION" > "$VERSION_FILE"
+            echo "Setup complete!"
+          fi
+
+          source "$VENV_DIR/bin/activate"
+          exec "$VENV_DIR/bin/voiced" "$@"
+        '';
+
+        # FHS environment for full compatibility
+        voicedFHS = pkgs.buildFHSEnv {
+          name = "voiced";
+          targetPkgs = pkgs: runtimeDeps ++ [
+            pythonEnv
+            pkgs.uv
+          ];
+          runScript = "${voicedWrapper}/bin/voiced";
+        };
+
       in
       {
+        packages.default = voicedFHS;
+
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
-            # Python with native extension dependencies
-            (python.withPackages (ps: with ps; [
-              # Native deps needed by pip packages
-              numpy
-              scipy
-              av
-              cryptography
-              pyopenssl
-              cffi
-              # D-Bus/tray dependencies
-              pygobject3
-              pycairo
-            ]))
-
-            # uv for fast dependency management
+            pythonEnv
             uv
-
-            # C/C++ toolchain for native extensions
-            stdenv.cc.cc.lib
             pkg-config
-
-            # Audio
             portaudio
             ffmpeg
-
-            # D-Bus and GLib for tray
             glib
             gobject-introspection
             cairo
-
-            # Wayland tools
             wtype
             wl-clipboard
-
-            # Development
             ruff
           ];
 
@@ -58,25 +121,20 @@
             echo "Python: $(python --version)"
             echo "uv: $(uv --version)"
 
-            # Library paths
             export LD_LIBRARY_PATH="${pkgs.portaudio}/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
 
-            # CUDA support
             if [ -d /run/opengl-driver/lib ]; then
               export LD_LIBRARY_PATH="/run/opengl-driver/lib:$LD_LIBRARY_PATH"
               echo "CUDA: enabled"
             fi
 
-            # GObject introspection
             export GI_TYPELIB_PATH="${pkgs.glib}/lib/girepository-1.0:${pkgs.gobject-introspection}/lib/girepository-1.0:$GI_TYPELIB_PATH"
 
-            # Create/sync venv with uv if needed
             if [ ! -d .venv ] || [ pyproject.toml -nt .venv ]; then
               echo "Syncing dependencies with uv..."
               uv sync --quiet
             fi
 
-            # Activate venv
             source .venv/bin/activate
           '';
         };
