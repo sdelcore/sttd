@@ -93,6 +93,11 @@
           targetPkgs = pkgs: runtimeDeps ++ [
             pythonEnv
             pkgs.uv
+            # Build tools needed for pycairo/pygobject compilation
+            pkgs.gcc
+            pkgs.pkg-config
+            pkgs.meson
+            pkgs.ninja
           ];
           runScript = "${voicedWrapper}/bin/voiced";
         };
