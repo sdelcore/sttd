@@ -29,6 +29,7 @@
           xorg.libX11.dev
           xorg.libXrender
           xorg.libXrender.dev
+          xorg.xorgproto
           wtype
           wl-clipboard
           stdenv.cc.cc.lib
@@ -83,11 +84,12 @@
             mkdir -p "$VOICED_HOME"
             rm -rf "$VENV_DIR"
 
-            ${pkgs.uv}/bin/uv venv "$VENV_DIR" --python ${pythonEnv}/bin/python --seed
+            ${pkgs.uv}/bin/uv venv "$VENV_DIR" --python ${pythonEnv}/bin/python --seed --system-site-packages
             source "$VENV_DIR/bin/activate"
 
             # Install voiced from bundled source
-            ${pkgs.uv}/bin/uv pip install "$SOURCE_DIR" --quiet
+            # Use --no-build-isolation to use system packages for pycairo/pygobject
+            ${pkgs.uv}/bin/uv pip install "$SOURCE_DIR" --quiet --no-build-isolation
 
             echo "$CURRENT_VERSION" > "$VERSION_FILE"
             echo "Setup complete!"
