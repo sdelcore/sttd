@@ -34,6 +34,7 @@
           wl-clipboard
           stdenv.cc.cc.lib
           cacert
+          zlib
         ];
 
         # Python with base packages that have native deps
