@@ -68,11 +68,11 @@
           VOICED_HOME="''${XDG_DATA_HOME:-$HOME/.local/share}/voiced"
           VENV_DIR="$VOICED_HOME/venv"
           VERSION_FILE="$VENV_DIR/.version"
-          CURRENT_VERSION="0.2.0"
+          CURRENT_VERSION="0.2.1"
           SOURCE_DIR="${voicedSrc}"
 
           export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath runtimeDeps}:''${LD_LIBRARY_PATH:-}"
-          export GI_TYPELIB_PATH="${pkgs.glib}/lib/girepository-1.0:${pkgs.gobject-introspection}/lib/girepository-1.0:''${GI_TYPELIB_PATH:-}"
+          export GI_TYPELIB_PATH="${pkgs.glib.out}/lib/girepository-1.0:${pkgs.gobject-introspection.out}/lib/girepository-1.0:''${GI_TYPELIB_PATH:-}"
           # Add pythonEnv site-packages to PYTHONPATH so gi/pycairo are available
           export PYTHONPATH="${pythonEnv}/${pythonEnv.sitePackages}:''${PYTHONPATH:-}"
 
@@ -148,7 +148,7 @@
               echo "CUDA: enabled"
             fi
 
-            export GI_TYPELIB_PATH="${pkgs.glib}/lib/girepository-1.0:${pkgs.gobject-introspection}/lib/girepository-1.0:$GI_TYPELIB_PATH"
+            export GI_TYPELIB_PATH="${pkgs.glib.out}/lib/girepository-1.0:${pkgs.gobject-introspection.out}/lib/girepository-1.0:$GI_TYPELIB_PATH"
 
             if [ ! -d .venv ] || [ pyproject.toml -nt .venv ]; then
               echo "Syncing dependencies with uv..."
