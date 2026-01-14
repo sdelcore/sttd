@@ -73,6 +73,8 @@
 
           export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath runtimeDeps}:''${LD_LIBRARY_PATH:-}"
           export GI_TYPELIB_PATH="${pkgs.glib}/lib/girepository-1.0:${pkgs.gobject-introspection}/lib/girepository-1.0:''${GI_TYPELIB_PATH:-}"
+          # Add pythonEnv site-packages to PYTHONPATH so gi/pycairo are available
+          export PYTHONPATH="${pythonEnv}/${pythonEnv.sitePackages}:''${PYTHONPATH:-}"
 
           # Add CUDA support if available
           if [ -d /run/opengl-driver/lib ]; then
