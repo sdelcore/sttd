@@ -81,6 +81,9 @@
             export LD_LIBRARY_PATH="/run/opengl-driver/lib:$LD_LIBRARY_PATH"
           fi
 
+          # Avoid SSH config permission issues in FHS environment
+          export GIT_SSH_COMMAND="ssh -F /dev/null"
+
           # Check if venv needs to be created/updated
           if [ ! -f "$VERSION_FILE" ] || [ "$(cat "$VERSION_FILE")" != "$CURRENT_VERSION" ]; then
             echo "Setting up voiced v$CURRENT_VERSION..."
