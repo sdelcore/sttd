@@ -27,6 +27,32 @@ A voice daemon for Linux/Wayland providing both **Speech-to-Text (STT)** and **T
 
 ## Installation
 
+### As a home-manager service
+
+The module ships with the flake, so there is nothing to write:
+
+```nix
+# flake.nix
+inputs.voiced.url = "github:sdelcore/voiced";
+
+# home/<hostname>.nix
+imports = [ inputs.voiced.homeModules.default ];
+services.voiced.enable = true;
+```
+
+That installs voiced with `wtype` and `wl-clipboard`, and runs it as a
+user unit with `--http`.
+
+`settings` writes `~/.config/voiced/config.toml` and is empty by
+default, which leaves the defaults in `src/voiced/config.py` in charge.
+Set only the keys you want to differ — a restated default stops tracking
+this repo the moment the value here changes, and nothing reports it.
+
+Options are declared in [`nix/hm-module.nix`](nix/hm-module.nix); read
+that rather than a copy here. The ones worth knowing: `settings`,
+`http`, `startAtLogin` (turn off when a compositor `exec-once` owns the
+lifecycle), `cudaDevice`, and `waylandDisplay`.
+
 ### Prerequisites (NixOS)
 
 This project uses Nix flakes for development. With direnv installed:
