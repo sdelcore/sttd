@@ -179,6 +179,36 @@ curl -X POST -H "Content-Type: application/json" \
   http://localhost:8765/synthesize --output speech.wav
 ```
 
+### OpenAI-compatible API
+
+The server also answers the OpenAI audio endpoints, so any client that can talk
+to OpenAI TTS/STT can use voiced by pointing its base URL at `/v1`:
+
+| Endpoint | Notes |
+|----------|-------|
+| `POST /v1/audio/speech` | `input`, `voice`, `speed`, `response_format` (`mp3` default, plus `wav`, `opus`, `aac`, `flac`, `pcm`). `model` is accepted and ignored |
+| `POST /v1/audio/transcriptions` | multipart with a `file` part, or JSON with a base64 `input_audio`. `response_format` `json` (default) or `text` |
+| `GET /v1/audio/voices` | `{"voices": [{"id", "name"}]}` — the Kokoro voice list, for client voice pickers |
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"input": "Hello world", "voice": "af_heart"}' \
+  http://localhost:8765/v1/audio/speech --output speech.mp3
+
+curl -X POST -F file=@audio.wav \
+  http://localhost:8765/v1/audio/transcriptions
+```
+
+Speaker diarization is off on `/v1/audio/transcriptions` — the OpenAI response
+has nowhere to carry speakers. Use `/transcribe` for segments and speaker IDs.
+
+Example — Open WebUI, Admin → Settings → Audio:
+
+```
+STT Engine: OpenAI     Base URL: http://<host>:8765/v1     Key: any non-empty value
+TTS Engine: OpenAI     Base URL: http://<host>:8765/v1     Voice: af_heart
+```
+
 ### Hyprland Configuration
 
 Add to `~/.config/hypr/hyprland.conf`:
