@@ -69,6 +69,7 @@ CLI Command → Unix Socket IPC → Daemon
 - `http_server.py` - HTTP server with `/transcribe`, `/synthesize`, `/health` endpoints
 - `http_client.py` - HTTP client for remote connections
 - WebSocket support for streaming TTS at `/synthesize/stream`
+- OpenAI-compatible aliases at `/v1/audio/speech`, `/v1/audio/transcriptions` and `/v1/audio/voices`. They translate to the same handlers, so a client written against the OpenAI audio API (Open WebUI, the OpenAI SDK) works unchanged. The native routes stay the richer ones — only they return segments and speaker IDs.
 
 **State Machine**: Daemon states are `IDLE → RECORDING → TRANSCRIBING → IDLE`. The tray icon reflects state visually.
 

@@ -1,12 +1,18 @@
 """HTTP server for transcription and TTS requests."""
 
+import base64
 import json
 import logging
+import os
 import re
+import subprocess
 import tempfile
 import threading
 import time
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
@@ -20,6 +26,132 @@ from voiced.transcriber import STT_MODEL, Transcriber
 from voiced.webrtc_server import WebRTCConnectionManager
 
 logger = logging.getLogger(__name__)
+
+SUFFIX_BY_CONTENT_TYPE = {
+    "audio/wav": ".wav",
+    "audio/webm": ".webm",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/flac": ".flac",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+}
+
+# response_format -> (Content-Type, ffmpeg output args). WAV is what the
+# synthesizer already produces, so it needs no re-encode.
+SPEECH_FORMATS: dict[str, tuple[str, list[str]]] = {
+    "wav": ("audio/wav", []),
+    "mp3": ("audio/mpeg", ["-f", "mp3"]),
+    "opus": ("audio/ogg", ["-f", "opus"]),
+    "aac": ("audio/aac", ["-f", "adts"]),
+    "flac": ("audio/flac", ["-f", "flac"]),
+    "pcm": ("audio/pcm", ["-f", "s16le"]),
+}
+
+TRANSCRIPTION_FORMATS = ("json", "text")
+
+
+class AudioDecodeError(Exception):
+    """Request audio could not be decoded to mono float32 PCM."""
+
+
+def suffix_for_content_type(content_type: str) -> str:
+    """Map a request Content-Type to the file suffix FFmpeg should assume."""
+    base = content_type.split(";")[0].strip().lower()
+    return SUFFIX_BY_CONTENT_TYPE.get(base, ".wav")
+
+
+def parse_multipart_fields(body: bytes, content_type: str) -> dict[str, tuple[bytes, str | None]]:
+    """Parse a multipart/form-data body into ``{field_name: (value, filename)}``."""
+    if "multipart/form-data" not in content_type.lower():
+        raise ValueError("Content-Type is not multipart/form-data")
+
+    message = BytesParser(policy=email_policy).parsebytes(
+        b"Content-Type: " + content_type.encode() + b"\r\n\r\n" + body
+    )
+    if not message.is_multipart():
+        raise ValueError("body is not multipart")
+
+    fields: dict[str, tuple[bytes, str | None]] = {}
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if name is None:
+            continue
+        fields[str(name)] = (part.get_payload(decode=True) or b"", part.get_filename())
+    return fields
+
+
+def transcode_wav(wav_bytes: bytes, response_format: str) -> bytes:
+    """Re-encode WAV bytes into one of the OpenAI speech formats."""
+    args = SPEECH_FORMATS[response_format][1]
+    if not args:
+        return wav_bytes
+
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", "pipe:0", *args, "pipe:1"],
+        input=wav_bytes,
+        capture_output=True,
+        check=True,
+    )
+    return result.stdout
+
+
+def decode_audio(audio_bytes: bytes, suffix: str) -> tuple[np.ndarray, int]:
+    """Decode arbitrary encoded audio to mono float32 samples and its sample rate.
+
+    Anything that is not already WAV goes through FFmpeg, which also resamples
+    to the 16kHz mono that Parakeet expects.
+    """
+    import soundfile as sf
+
+    temp_path = None
+    wav_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            f.write(audio_bytes)
+            temp_path = f.name
+
+        if suffix != ".wav":
+            wav_path = temp_path.rsplit(".", 1)[0] + ".wav"
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    temp_path,
+                    "-ar",
+                    "16000",
+                    "-ac",
+                    "1",
+                    "-f",
+                    "wav",
+                    wav_path,
+                ],
+                capture_output=True,
+                check=True,
+            )
+            audio_path = wav_path
+        else:
+            audio_path = temp_path
+
+        audio, sample_rate = sf.read(audio_path, dtype="float32")
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode(errors="replace") if e.stderr else ""
+        logger.error(f"FFmpeg conversion failed: {stderr}")
+        raise AudioDecodeError(f"Failed to convert audio: {stderr}") from e
+    except Exception as e:
+        logger.error(f"Failed to read audio: {e}")
+        raise AudioDecodeError(f"Failed to read audio file: {e}") from e
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+        if wav_path and os.path.exists(wav_path):
+            os.unlink(wav_path)
+
+    if len(audio.shape) > 1:
+        audio = audio.mean(axis=1)
+    return audio, sample_rate
 
 
 class TranscriptionHandler(BaseHTTPRequestHandler):
@@ -59,6 +191,25 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
     def _send_error_json(self, status: int, message: str, code: str) -> None:
         self._send_json(status, {"error": message, "code": code})
 
+    def _read_json_body(self, max_bytes: int) -> dict | None:
+        """Read a JSON request body. Sends the error response and returns None on failure."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            self._send_error_json(400, "No request body", "NO_BODY")
+            return None
+
+        if content_length > max_bytes:
+            self._send_error_json(
+                413, f"Request body too large (max {max_bytes} bytes)", "BODY_TOO_LARGE"
+            )
+            return None
+
+        try:
+            return json.loads(self.rfile.read(content_length).decode("utf-8"))
+        except json.JSONDecodeError as e:
+            self._send_error_json(400, f"Invalid JSON: {e}", "INVALID_JSON")
+            return None
+
     def _profile_store_for(self, profiles_path: str | None = None):
         """Resolve which ProfileStore this request uses.
 
@@ -97,6 +248,8 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
                 self._send_error_json(404, "Not found", "NOT_FOUND")
         elif path == "/voices":
             self._handle_list_voices()
+        elif path == "/v1/audio/voices":
+            self._handle_openai_voices()
         elif path.startswith("/voices/"):
             name = self._parse_voice_name(path)
             if name:
@@ -112,6 +265,10 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
 
         if path == "/transcribe":
             self._handle_transcribe(parsed.query)
+        elif path == "/v1/audio/transcriptions":
+            self._handle_openai_transcriptions()
+        elif path == "/v1/audio/speech":
+            self._handle_openai_speech()
         elif path == "/synthesize":
             self._handle_synthesize(parsed.query)
         elif path == "/synthesize/stream":
@@ -205,80 +362,13 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
             return
 
         audio_bytes = self.rfile.read(content_length)
+        suffix = suffix_for_content_type(self.headers.get("Content-Type", "audio/wav"))
 
-        # Use FFmpeg to convert any audio format to WAV, then read with soundfile
-        import os
-        import subprocess
-
-        import soundfile as sf
-
-        # Determine file extension from Content-Type header
-        content_type = self.headers.get("Content-Type", "audio/wav")
-        ext_map = {
-            "audio/wav": ".wav",
-            "audio/webm": ".webm",
-            "audio/mpeg": ".mp3",
-            "audio/mp3": ".mp3",
-            "audio/ogg": ".ogg",
-            "audio/flac": ".flac",
-            "audio/mp4": ".m4a",
-            "audio/x-m4a": ".m4a",
-        }
-        suffix = ext_map.get(content_type, ".wav")
-
-        temp_path = None
-        wav_path = None
         try:
-            # Write input audio to temp file
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-                f.write(audio_bytes)
-                temp_path = f.name
-
-            # For non-WAV formats, convert to WAV using FFmpeg
-            if suffix != ".wav":
-                wav_path = temp_path.rsplit(".", 1)[0] + ".wav"
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-i",
-                        temp_path,
-                        "-ar",
-                        "16000",  # Resample to 16kHz (Parakeet's expected rate)
-                        "-ac",
-                        "1",  # Convert to mono
-                        "-f",
-                        "wav",
-                        wav_path,
-                    ],
-                    capture_output=True,
-                    check=True,
-                )
-                audio_path = wav_path
-            else:
-                audio_path = temp_path
-
-            audio, sample_rate = sf.read(audio_path, dtype="float32")
-
-            # Convert stereo to mono if needed (for WAV input that wasn't converted)
-            if len(audio.shape) > 1:
-                audio = audio.mean(axis=1)
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"FFmpeg conversion failed: {e.stderr.decode()}")
-            self._send_error_json(
-                400, f"Failed to convert audio: {e.stderr.decode()}", "INVALID_AUDIO"
-            )
+            audio, sample_rate = decode_audio(audio_bytes, suffix)
+        except AudioDecodeError as e:
+            self._send_error_json(400, str(e), "INVALID_AUDIO")
             return
-        except Exception as e:
-            logger.error(f"Failed to read audio: {e}")
-            self._send_error_json(400, f"Failed to read audio file: {e}", "INVALID_AUDIO")
-            return
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                os.unlink(temp_path)
-            if wav_path and os.path.exists(wav_path):
-                os.unlink(wav_path)
 
         duration = len(audio) / sample_rate
         logger.info(f"Transcribing {duration:.1f}s of audio at {sample_rate}Hz")
@@ -507,21 +597,8 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # Parse request body
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length == 0:
-            self._send_error_json(400, "No request body", "NO_BODY")
-            return
-
-        if content_length > 1024 * 1024:  # 1MB max for text
-            self._send_error_json(413, "Request body too large (max 1MB)", "BODY_TOO_LARGE")
-            return
-
-        try:
-            body = self.rfile.read(content_length)
-            data = json.loads(body.decode("utf-8"))
-        except json.JSONDecodeError as e:
-            self._send_error_json(400, f"Invalid JSON: {e}", "INVALID_JSON")
+        data = self._read_json_body(max_bytes=1024 * 1024)
+        if data is None:
             return
 
         text = data.get("text", "").strip()
@@ -562,6 +639,181 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.exception(f"TTS synthesis failed: {e}")
             self._send_error_json(500, f"Synthesis failed: {e}", "SYNTHESIS_ERROR")
+
+    def _handle_openai_speech(self) -> None:
+        """Handle POST /v1/audio/speech - the OpenAI speech API over Kokoro."""
+        synthesizer = self.voiced.synthesizer
+        if synthesizer is None:
+            self._send_error_json(
+                503,
+                "TTS is not available (Kokoro not installed or TTS disabled)",
+                "TTS_UNAVAILABLE",
+            )
+            return
+
+        data = self._read_json_body(max_bytes=1024 * 1024)
+        if data is None:
+            return
+
+        text = str(data.get("input", "")).strip()
+        if not text:
+            self._send_error_json(400, "No input provided", "NO_TEXT")
+            return
+
+        if len(text) > 10000:
+            self._send_error_json(400, "Text too long (max 10000 chars)", "TEXT_TOO_LONG")
+            return
+
+        response_format = str(data.get("response_format") or "mp3").lower()
+        if response_format not in SPEECH_FORMATS:
+            self._send_error_json(
+                400,
+                f"Unsupported response_format '{response_format}' "
+                f"(supported: {', '.join(SPEECH_FORMATS)})",
+                "INVALID_FORMAT",
+            )
+            return
+
+        # `model` is accepted and ignored: this server hosts exactly one voice model.
+        voice = data.get("voice") or self.config.tts.default_voice
+        speed = data.get("speed") or self.config.tts.speed
+
+        logger.info(f"Synthesizing {len(text)} chars with voice '{voice}' as {response_format}")
+
+        try:
+            start_time = time.time()
+            audio = synthesizer.synthesize(text, voice=voice, speed=speed)
+            body = transcode_wav(audio_to_wav(audio, synthesizer.sample_rate), response_format)
+            elapsed = time.time() - start_time
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode(errors="replace") if e.stderr else ""
+            logger.error(f"Encoding to {response_format} failed: {stderr}")
+            self._send_error_json(500, f"Failed to encode {response_format}", "ENCODE_ERROR")
+            return
+        except Exception as e:
+            logger.exception(f"TTS synthesis failed: {e}")
+            self._send_error_json(500, f"Synthesis failed: {e}", "SYNTHESIS_ERROR")
+            return
+
+        TranscriptionHandler.tts_request_count += 1
+
+        self.send_response(200)
+        self.send_header("Content-Type", SPEECH_FORMATS[response_format][0])
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Audio-Duration", str(round(len(audio) / synthesizer.sample_rate, 2)))
+        self.send_header("X-Processing-Time", str(round(elapsed, 2)))
+        self.send_header("X-Voice", voice)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_openai_transcriptions(self) -> None:
+        """Handle POST /v1/audio/transcriptions - the OpenAI STT API over Parakeet.
+
+        Accepts both request shapes clients use: multipart/form-data with a
+        ``file`` part, and JSON with a base64 ``input_audio``. Speaker
+        diarization is off — the OpenAI response has nowhere to carry it.
+        """
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            self._send_error_json(400, "No audio data provided", "NO_AUDIO")
+            return
+
+        if content_length > 100 * 1024 * 1024:
+            self._send_error_json(413, "Audio file too large (max 100MB)", "AUDIO_TOO_LARGE")
+            return
+
+        content_type = self.headers.get("Content-Type", "")
+        body = self.rfile.read(content_length)
+
+        if content_type.split(";")[0].strip().lower() == "application/json":
+            try:
+                data = json.loads(body.decode("utf-8"))
+            except json.JSONDecodeError as e:
+                self._send_error_json(400, f"Invalid JSON: {e}", "INVALID_JSON")
+                return
+
+            input_audio = data.get("input_audio") or {}
+            try:
+                audio_bytes = base64.b64decode(input_audio.get("data", ""), validate=True)
+            except (ValueError, TypeError):
+                self._send_error_json(400, "input_audio.data is not valid base64", "INVALID_AUDIO")
+                return
+
+            suffix = "." + str(input_audio.get("format") or "wav").lstrip(".").lower()
+            response_format = str(data.get("response_format") or "json").lower()
+        else:
+            try:
+                fields = parse_multipart_fields(body, content_type)
+            except ValueError as e:
+                self._send_error_json(400, f"Invalid request body: {e}", "INVALID_BODY")
+                return
+
+            if "file" not in fields:
+                self._send_error_json(400, "No file field in request", "NO_AUDIO")
+                return
+
+            audio_bytes, filename = fields["file"]
+            suffix = Path(filename).suffix.lower() if filename else ".wav"
+            format_field = fields.get("response_format")
+            response_format = (
+                format_field[0].decode("utf-8", "replace").lower() if format_field else "json"
+            )
+
+        if not audio_bytes:
+            self._send_error_json(400, "No audio data provided", "NO_AUDIO")
+            return
+
+        if response_format not in TRANSCRIPTION_FORMATS:
+            self._send_error_json(
+                400,
+                f"Unsupported response_format '{response_format}' "
+                f"(supported: {', '.join(TRANSCRIPTION_FORMATS)})",
+                "INVALID_FORMAT",
+            )
+            return
+
+        try:
+            audio, sample_rate = decode_audio(audio_bytes, suffix or ".wav")
+        except AudioDecodeError as e:
+            self._send_error_json(400, str(e), "INVALID_AUDIO")
+            return
+
+        logger.info(f"Transcribing {len(audio) / sample_rate:.1f}s of audio at {sample_rate}Hz")
+
+        try:
+            output = self.voiced.transcribe(
+                audio,
+                sample_rate,
+                identify_speakers=False,
+                profile_store=self._profile_store_for(None),
+            )
+        except Exception as e:
+            logger.exception(f"Transcription failed: {e}")
+            self._send_error_json(500, f"Transcription failed: {e}", "TRANSCRIPTION_ERROR")
+            return
+
+        TranscriptionHandler.request_count += 1
+
+        if response_format == "text":
+            payload = output.text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        else:
+            self._send_json(200, {"text": output.text})
+
+    def _handle_openai_voices(self) -> None:
+        """Handle GET /v1/audio/voices - voice list in the shape OpenAI clients expect."""
+        try:
+            voices = [
+                {"id": name, "name": name} for name in self.voiced.voice_manager.list_available()
+            ]
+            self._send_json(200, {"voices": voices})
+        except Exception as e:
+            logger.exception(f"Failed to list voices: {e}")
+            self._send_error_json(500, f"Failed to list voices: {e}", "VOICE_LIST_ERROR")
 
     def _handle_synthesize_stream(self, query_string: str) -> None:
         """Handle POST /synthesize/stream - streaming TTS synthesis.
