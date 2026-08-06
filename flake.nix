@@ -71,8 +71,7 @@
 
           VOICED_HOME="''${XDG_DATA_HOME:-$HOME/.local/share}/voiced"
           VENV_DIR="$VOICED_HOME/venv"
-          VERSION_FILE="$VENV_DIR/.version"
-          CURRENT_VERSION="${voicedVersion}"
+          SOURCE_FILE="$VENV_DIR/.source"
           SOURCE_DIR="${voicedSrc}"
 
           export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath runtimeDeps}:''${LD_LIBRARY_PATH:-}"
@@ -88,20 +87,34 @@
           # Avoid SSH config permission issues in FHS environment
           export GIT_SSH_COMMAND="ssh -F /dev/null"
 
-          # Check if venv needs to be created/updated
-          if [ ! -f "$VERSION_FILE" ] || [ "$(cat "$VERSION_FILE")" != "$CURRENT_VERSION" ]; then
-            echo "Setting up voiced v$CURRENT_VERSION..."
+          # Build the venv only when it is missing or its interpreter is gone,
+          # which is the expensive path — it reinstalls the whole dependency
+          # tree. A dangling bin/python (garbage-collected pythonEnv) fails the
+          # -x test and rebuilds.
+          if [ ! -x "$VENV_DIR/bin/python" ]; then
+            echo "Creating voiced venv..."
             mkdir -p "$VOICED_HOME"
             rm -rf "$VENV_DIR"
 
             ${pkgs.uv}/bin/uv venv "$VENV_DIR" --python ${pythonEnv}/bin/python --seed --system-site-packages
-            source "$VENV_DIR/bin/activate"
+          fi
 
-            # Install voiced from bundled source
-            # PyGObject removed from deps - provided by pythonEnv system-site-packages
-            ${pkgs.uv}/bin/uv pip install "$SOURCE_DIR" --quiet
+          # Reinstall whenever the bundled source changes. The store path is
+          # content addressed, so any edit gives a new one — keying on it
+          # instead of the version means a source-only change still reaches the
+          # venv. Keying on the version silently shipped stale code twice
+          # (#13, #18). Deps are resolved here too, so adding a dependency
+          # lands without a venv rebuild.
+          # PyGObject removed from deps - provided by pythonEnv system-site-packages
+          if [ ! -f "$SOURCE_FILE" ] || [ "$(cat "$SOURCE_FILE")" != "$SOURCE_DIR" ]; then
+            echo "Installing voiced from $SOURCE_DIR..."
+            ${pkgs.uv}/bin/uv pip install \
+              --python "$VENV_DIR/bin/python" \
+              --reinstall-package voiced \
+              "$SOURCE_DIR" --quiet
 
-            echo "$CURRENT_VERSION" > "$VERSION_FILE"
+            echo "$SOURCE_DIR" > "$SOURCE_FILE"
+            rm -f "$VENV_DIR/.version"
             echo "Setup complete!"
           fi
 
