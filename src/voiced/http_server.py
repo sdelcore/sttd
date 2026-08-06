@@ -52,14 +52,80 @@ SPEECH_FORMATS: dict[str, tuple[str, list[str]]] = {
 TRANSCRIPTION_FORMATS = ("json", "text")
 
 
+# Chunk-size lines are short; anything longer is a malformed body, not a chunk
+# header. readline() is bounded so a hostile client cannot buffer without limit.
+MAX_CHUNK_LINE = 1024
+
+
 class AudioDecodeError(Exception):
     """Request audio could not be decoded to mono float32 PCM."""
+
+
+class BodyTooLargeError(Exception):
+    """Request body exceeded the limit the handler allows."""
+
+
+class MalformedBodyError(Exception):
+    """Request body did not follow its declared framing."""
 
 
 def suffix_for_content_type(content_type: str) -> str:
     """Map a request Content-Type to the file suffix FFmpeg should assume."""
     base = content_type.split(";")[0].strip().lower()
     return SUFFIX_BY_CONTENT_TYPE.get(base, ".wav")
+
+
+def read_chunked_body(rfile, max_bytes: int) -> bytes:
+    """Read a ``Transfer-Encoding: chunked`` body from ``rfile``.
+
+    Clients that stream an upload — aiohttp does this whenever the payload is a
+    generator rather than a sized buffer — send no Content-Length, so the body
+    has to be reassembled from its chunk framing instead.
+
+    Raises BodyTooLargeError once the accumulated size passes ``max_bytes``, and
+    MalformedBodyError if the framing is broken or the peer disconnects early.
+    """
+    body = bytearray()
+
+    while True:
+        line = rfile.readline(MAX_CHUNK_LINE)
+        if not line:
+            raise MalformedBodyError("connection closed before the final chunk")
+        if len(line) >= MAX_CHUNK_LINE and not line.endswith(b"\n"):
+            raise MalformedBodyError("chunk size line is too long")
+
+        # A chunk header may carry extensions after a semicolon; ignore them.
+        size_field = line.split(b";", 1)[0].strip()
+        try:
+            size = int(size_field, 16)
+        except ValueError:
+            raise MalformedBodyError(f"invalid chunk size {size_field!r}") from None
+        if size < 0:
+            raise MalformedBodyError(f"negative chunk size {size_field!r}")
+        if size == 0:
+            break
+
+        if len(body) + size > max_bytes:
+            raise BodyTooLargeError(f"body exceeds {max_bytes} bytes")
+
+        remaining = size
+        while remaining:
+            chunk = rfile.read(remaining)
+            if not chunk:
+                raise MalformedBodyError("connection closed mid-chunk")
+            body += chunk
+            remaining -= len(chunk)
+
+        if rfile.read(2) != b"\r\n":
+            raise MalformedBodyError("chunk is not terminated by CRLF")
+
+    # Drain optional trailer headers up to the blank line that ends the body.
+    while True:
+        line = rfile.readline(MAX_CHUNK_LINE)
+        if not line or line in (b"\r\n", b"\n"):
+            break
+
+    return bytes(body)
 
 
 def parse_multipart_fields(body: bytes, content_type: str) -> dict[str, tuple[bytes, str | None]]:
@@ -163,6 +229,9 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
     tts_request_count: int = 0
     protocol_version = "HTTP/1.1"
 
+    # Reset per request; one handler instance serves a whole keep-alive connection.
+    _body_consumed: bool = False
+
     # WebRTC connection manager
     _webrtc_manager: WebRTCConnectionManager | None = None
     _asyncio_loop = None
@@ -180,6 +249,10 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args) -> None:
         logger.info("%s - %s", self.address_string(), format % args)
 
+    def handle_one_request(self) -> None:
+        self._body_consumed = False
+        super().handle_one_request()
+
     def _send_json(self, status: int, data: dict) -> None:
         body = json.dumps(data).encode("utf-8")
         self.send_response(status)
@@ -189,23 +262,77 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_error_json(self, status: int, message: str, code: str) -> None:
+        # Answering before the body is read leaves those bytes in the socket,
+        # where keep-alive would parse them as the next request. Close instead.
+        if self._request_has_body() and not self._body_consumed:
+            self.close_connection = True
         self._send_json(status, {"error": message, "code": code})
+
+    def _request_has_body(self) -> bool:
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            return True
+        try:
+            return int(self.headers.get("Content-Length", 0)) > 0
+        except ValueError:
+            return False
+
+    def _read_body(
+        self,
+        max_bytes: int,
+        too_large_message: str = "Request body too large",
+        too_large_code: str = "BODY_TOO_LARGE",
+    ) -> bytes | None:
+        """Read the request body, whether it is sized or chunked.
+
+        Returns b"" when the request carries no body, and None once an error
+        response has already been sent.
+        """
+        self._body_consumed = True
+
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            try:
+                return read_chunked_body(self.rfile, max_bytes)
+            except BodyTooLargeError:
+                self._body_consumed = False
+                self._send_error_json(413, too_large_message, too_large_code)
+                return None
+            except MalformedBodyError as e:
+                self._body_consumed = False
+                self._send_error_json(400, f"Malformed chunked body: {e}", "INVALID_BODY")
+                return None
+
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._body_consumed = False
+            self._send_error_json(400, "Invalid Content-Length", "INVALID_BODY")
+            return None
+
+        if content_length <= 0:
+            return b""
+
+        if content_length > max_bytes:
+            self._body_consumed = False
+            self._send_error_json(413, too_large_message, too_large_code)
+            return None
+
+        body = self.rfile.read(content_length)
+        if len(body) < content_length:
+            self._send_error_json(400, "Request body ended early", "INVALID_BODY")
+            return None
+        return body
 
     def _read_json_body(self, max_bytes: int) -> dict | None:
         """Read a JSON request body. Sends the error response and returns None on failure."""
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length == 0:
+        body = self._read_body(max_bytes, f"Request body too large (max {max_bytes} bytes)")
+        if body is None:
+            return None
+        if not body:
             self._send_error_json(400, "No request body", "NO_BODY")
             return None
 
-        if content_length > max_bytes:
-            self._send_error_json(
-                413, f"Request body too large (max {max_bytes} bytes)", "BODY_TOO_LARGE"
-            )
-            return None
-
         try:
-            return json.loads(self.rfile.read(content_length).decode("utf-8"))
+            return json.loads(body.decode("utf-8"))
         except json.JSONDecodeError as e:
             self._send_error_json(400, f"Invalid JSON: {e}", "INVALID_JSON")
             return None
@@ -340,16 +467,6 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
         self._send_json(200, status_data)
 
     def _handle_transcribe(self, query_string: str) -> None:
-        content_length = int(self.headers.get("Content-Length", 0))
-
-        if content_length == 0:
-            self._send_error_json(400, "No audio data provided", "NO_AUDIO")
-            return
-
-        if content_length > 100 * 1024 * 1024:
-            self._send_error_json(413, "Audio file too large (max 100MB)", "AUDIO_TOO_LARGE")
-            return
-
         query_params = parse_qs(query_string)
         identify_speakers_param = query_params.get("identify_speakers", ["true"])[0]
         identify_speakers = identify_speakers_param.lower() == "true"
@@ -361,7 +478,15 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
             self._send_error_json(400, "num_speakers must be an integer", "INVALID_PARAM")
             return
 
-        audio_bytes = self.rfile.read(content_length)
+        audio_bytes = self._read_body(
+            100 * 1024 * 1024, "Audio file too large (max 100MB)", "AUDIO_TOO_LARGE"
+        )
+        if audio_bytes is None:
+            return
+        if not audio_bytes:
+            self._send_error_json(400, "No audio data provided", "NO_AUDIO")
+            return
+
         suffix = suffix_for_content_type(self.headers.get("Content-Type", "audio/wav"))
 
         try:
@@ -449,17 +574,14 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
 
     def _handle_create_profile(self, name: str) -> None:
         """Handle POST /profiles/{name} - create profile from audio."""
-        content_length = int(self.headers.get("Content-Length", 0))
-
-        if content_length == 0:
+        wav_bytes = self._read_body(
+            50 * 1024 * 1024, "Audio file too large (max 50MB)", "AUDIO_TOO_LARGE"
+        )
+        if wav_bytes is None:
+            return
+        if not wav_bytes:
             self._send_error_json(400, "No audio data provided", "NO_AUDIO")
             return
-
-        if content_length > 50 * 1024 * 1024:
-            self._send_error_json(413, "Audio file too large (max 50MB)", "AUDIO_TOO_LARGE")
-            return
-
-        wav_bytes = self.rfile.read(content_length)
 
         try:
             audio, sample_rate = wav_to_audio(wav_bytes)
@@ -713,17 +835,15 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
         ``file`` part, and JSON with a base64 ``input_audio``. Speaker
         diarization is off — the OpenAI response has nowhere to carry it.
         """
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length == 0:
+        content_type = self.headers.get("Content-Type", "")
+        body = self._read_body(
+            100 * 1024 * 1024, "Audio file too large (max 100MB)", "AUDIO_TOO_LARGE"
+        )
+        if body is None:
+            return
+        if not body:
             self._send_error_json(400, "No audio data provided", "NO_AUDIO")
             return
-
-        if content_length > 100 * 1024 * 1024:
-            self._send_error_json(413, "Audio file too large (max 100MB)", "AUDIO_TOO_LARGE")
-            return
-
-        content_type = self.headers.get("Content-Type", "")
-        body = self.rfile.read(content_length)
 
         if content_type.split(";")[0].strip().lower() == "application/json":
             try:
@@ -834,21 +954,8 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # Parse request body
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length == 0:
-            self._send_error_json(400, "No request body", "NO_BODY")
-            return
-
-        if content_length > 1024 * 1024:
-            self._send_error_json(413, "Request body too large (max 1MB)", "BODY_TOO_LARGE")
-            return
-
-        try:
-            body = self.rfile.read(content_length)
-            data = json.loads(body.decode("utf-8"))
-        except json.JSONDecodeError as e:
-            self._send_error_json(400, f"Invalid JSON: {e}", "INVALID_JSON")
+        data = self._read_json_body(1024 * 1024)
+        if data is None:
             return
 
         text = data.get("text", "").strip()
@@ -948,18 +1055,15 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
             self._send_error_json(503, "WebRTC event loop not running", "WEBRTC_NOT_READY")
             return
 
-        # Read request body
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length == 0:
+        # 64KB limit for SDP
+        body = self._read_body(64 * 1024, "Offer too large", "OFFER_TOO_LARGE")
+        if body is None:
+            return
+        if not body:
             self._send_error_json(400, "No offer provided", "NO_OFFER")
             return
 
-        if content_length > 64 * 1024:  # 64KB limit for SDP
-            self._send_error_json(413, "Offer too large", "OFFER_TOO_LARGE")
-            return
-
         try:
-            body = self.rfile.read(content_length)
             data = json.loads(body.decode("utf-8"))
             offer_sdp = data.get("sdp")
 
@@ -1004,13 +1108,14 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
             self._send_error_json(503, "WebRTC event loop not running", "WEBRTC_NOT_READY")
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length == 0:
+        body = self._read_body(64 * 1024)
+        if body is None:
+            return
+        if not body:
             self._send_error_json(400, "No ICE candidate provided", "NO_ICE")
             return
 
         try:
-            body = self.rfile.read(content_length)
             data = json.loads(body.decode("utf-8"))
 
             session_id = data.get("session_id")
