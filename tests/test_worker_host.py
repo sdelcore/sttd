@@ -24,6 +24,7 @@ if (
 ):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
+from voiced import worker
 from voiced.config import Config
 from voiced.speaker_segments import IdentifiedSegment
 from voiced.worker_host import (
@@ -53,6 +54,12 @@ class FakeTranscriber:
         path = str(path)
         if path == "/crash":
             os._exit(1)
+        if path.startswith("/crash-once:"):
+            flag = Path(path.removeprefix("/crash-once:"))
+            if not flag.exists():
+                flag.touch()
+                os._exit(1)
+            return "recovered"
         if path == "/boom":
             raise ValueError("boom")
         if path == "/missing":
@@ -93,6 +100,15 @@ class FakeSynthesizer:
                     raise RuntimeError("gate file never appeared")
                 time.sleep(0.01)
             yield np.full(10, 2.0, dtype=np.float32)
+        elif text.startswith("crash-once:"):
+            flag = Path(text.removeprefix("crash-once:"))
+            if not flag.exists():
+                flag.touch()
+                os._exit(1)
+            yield np.full(10, 3.0, dtype=np.float32)
+        elif text == "crash-mid-stream":
+            yield np.full(10, 1.0, dtype=np.float32)
+            os._exit(1)
         elif text == "boom-mid-stream":
             yield np.full(10, 1.0, dtype=np.float32)
             raise ValueError("stream boom")
@@ -409,6 +425,29 @@ class TestCrashRecovery:
         with pytest.raises(WorkerCrashError):
             transcriber.transcribe_file("/crash")
 
+    def test_single_crash_is_retried_on_a_fresh_worker(self, host, tmp_path):
+        """One dead worker must not cost the caller a request."""
+        transcriber = WorkerTranscriber(host)
+        flag = tmp_path / "crashed"
+        assert transcriber.transcribe_file(f"/crash-once:{flag}") == "recovered"
+        assert flag.exists()  # the first worker really did die
+
+    def test_stream_crash_before_first_chunk_is_retried(self, host, tmp_path):
+        synth = WorkerSynthesizer(host, Config())
+        flag = tmp_path / "crashed"
+        chunks = list(synth.synthesize_streaming(f"crash-once:{flag}"))
+        assert len(chunks) == 1
+        assert chunks[0][0] == 3.0
+        assert flag.exists()
+
+    def test_stream_crash_after_first_chunk_is_reported(self, host):
+        """Retrying mid-stream would replay audio the consumer already has."""
+        synth = WorkerSynthesizer(host, Config())
+        stream = synth.synthesize_streaming("crash-mid-stream")
+        assert next(stream)[0] == 1.0
+        with pytest.raises(WorkerCrashError):
+            next(stream)
+
     def test_next_request_starts_fresh_worker(self, host):
         transcriber = WorkerTranscriber(host)
         with pytest.raises(WorkerCrashError):
@@ -418,6 +457,47 @@ class TestCrashRecovery:
         pid = int(transcriber.transcribe_file("/pid"))
         assert host.is_running
         assert not pid_gone(pid)
+
+
+# ----- native library preload -----
+
+
+class _RecordingConn:
+    """Worker end of the pipe, for driving worker_main in-process."""
+
+    def __init__(self, inbox):
+        self.sent = []
+        self._inbox = list(inbox)
+
+    def send(self, message):
+        self.sent.append(message)
+
+    def recv(self):
+        if not self._inbox:
+            raise EOFError
+        return self._inbox.pop(0)
+
+    def close(self):
+        pass
+
+
+class TestNativePreload:
+    def test_absent_module_is_skipped(self):
+        worker.preload_native_stack(("json", "voiced_no_such_module"))
+
+    def test_preload_runs_before_the_ready_handshake(self, monkeypatch):
+        """Both models must load into a process that already holds the
+        order-sensitive native libraries."""
+        conn = _RecordingConn([("shutdown",)])
+        monkeypatch.setattr(worker, "preload_native_stack", lambda: conn.send(("preloaded",)))
+
+        previous = signal.getsignal(signal.SIGINT)
+        try:
+            worker.worker_main(conn, Config())
+        finally:
+            signal.signal(signal.SIGINT, previous)
+
+        assert conn.sent == [("preloaded",), ("ready",)]
 
 
 # ----- shutdown -----

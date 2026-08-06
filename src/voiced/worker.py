@@ -19,14 +19,18 @@ Protocol (tuples over a duplex ``multiprocessing.Pipe``):
 STT results are wrapped as ``{"value": ..., "device": ...}`` so the parent
 can report the resolved device without a CUDA-touching import.
 
-Torch/NeMo/Kokoro are imported lazily inside this process only. The module
-itself must stay import-light: ``spawn`` re-imports it in the child, and the
-parent imports it to reference ``worker_main``.
+Torch/NeMo/Kokoro are imported lazily inside this process only, after
+``preload_native_stack`` has pinned the load order of the libraries that
+cannot tolerate an arbitrary one. The module itself must stay import-light:
+``spawn`` re-imports it in the child, and the parent imports it to reference
+``worker_main``.
 """
 
+import importlib
 import logging
 import signal
 import threading
+import time
 import traceback
 from multiprocessing.connection import Connection
 from typing import Any
@@ -38,6 +42,14 @@ logger = logging.getLogger(__name__)
 # Streamed ops send ("chunk", ...) messages instead of a single result.
 STREAMING_OPS = {"tts.synthesize_streaming"}
 
+# Native libraries whose load order in the process is not interchangeable.
+# The STT stack (NeMo -> lhotse -> pyarrow.dataset) segfaults inside Arrow's
+# mimalloc allocator when it is dlopen'd into a process where Kokoro and torch
+# already live; the reverse order is safe. Because models load on first use,
+# request order used to decide library order, so a TTS request followed by an
+# STT request on the same worker killed the process.
+PRELOAD_MODULES = ("pyarrow.dataset", "lhotse")
+
 
 def _describe_exception(exc: BaseException) -> dict:
     return {
@@ -45,6 +57,25 @@ def _describe_exception(exc: BaseException) -> dict:
         "message": str(exc),
         "traceback": "".join(traceback.format_exception(exc)),
     }
+
+
+def preload_native_stack(modules: tuple[str, ...] = PRELOAD_MODULES) -> None:
+    """Import the order-sensitive native libraries on the worker's main thread.
+
+    Runs before any model loads, so both models always enter a process that
+    holds the safe library order. A module that is absent is skipped: a
+    TTS-only install has no NeMo stack.
+    """
+    for name in modules:
+        started = time.monotonic()
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            logger.debug(f"Preload skipped: {name} is not installed")
+        except Exception:
+            logger.warning(f"Preload of {name} failed", exc_info=True)
+        else:
+            logger.info(f"Preloaded {name} in {time.monotonic() - started:.1f}s")
 
 
 def default_transcriber_factory(config: Config) -> Any:
@@ -230,6 +261,8 @@ def worker_main(
     # The parent drives shutdown through the protocol (then SIGTERM/SIGKILL
     # as escalation); a terminal Ctrl+C must not race that sequence.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    preload_native_stack()
 
     state = _WorkerState(
         conn,

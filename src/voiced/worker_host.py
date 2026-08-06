@@ -17,6 +17,7 @@ import logging
 import queue
 import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
 from multiprocessing import get_context
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -272,35 +273,79 @@ class WorkerHost:
     # ----- requests -----
 
     def request(self, op: str, **kwargs) -> Any:
-        """Run one operation on the worker, starting it if needed."""
-        with self._host.use() as handle:
-            req_id, q = handle.open_request(op, kwargs)
-            try:
-                result = self._wait_result(q)
-            finally:
-                handle.close_request(req_id)
-            self._mark_used(op)
-            return result
+        """Run one operation on the worker, starting it if needed.
+
+        A worker that dies mid-operation costs the caller nothing: inference
+        ops have no side effects, so the operation runs once more on a fresh
+        worker. A second crash is reported.
+        """
+        try:
+            return self._request_once(op, kwargs)
+        except WorkerCrashError as exc:
+            logger.warning(f"Worker died during {op} ({exc}); retrying on a fresh worker")
+        return self._request_once(op, kwargs)
 
     def stream(self, op: str, **kwargs) -> Iterator[Any]:
         """Run a streaming operation, holding the worker lease until the
-        stream is fully consumed (or the consumer stops iterating)."""
+        stream is fully consumed (or the consumer stops iterating).
+
+        Retries like ``request`` while no chunk has reached the consumer;
+        once the first chunk is out, a crash is reported.
+        """
+        started = False
+        try:
+            for chunk in self._stream_once(op, kwargs):
+                started = True
+                yield chunk
+            return
+        except WorkerCrashError as exc:
+            if started:
+                raise
+            logger.warning(f"Worker died during {op} ({exc}); retrying on a fresh worker")
+        yield from self._stream_once(op, kwargs)
+
+    def _request_once(self, op: str, kwargs: dict) -> Any:
         with self._host.use() as handle:
-            req_id, q = handle.open_request(op, kwargs)
-            try:
-                while True:
-                    kind, payload = q.get()
-                    if kind == "chunk":
-                        self._mark_used(op)
-                        yield payload
-                    elif kind == "end":
-                        break
-                    elif kind == "error":
-                        raise _rebuild_exception(payload)
-                    elif kind == "crash":
-                        raise WorkerCrashError(payload)
-            finally:
-                handle.close_request(req_id)
+            with self._retire_on_crash(handle):
+                req_id, q = handle.open_request(op, kwargs)
+                try:
+                    result = self._wait_result(q)
+                finally:
+                    handle.close_request(req_id)
+            self._mark_used(op)
+            return result
+
+    def _stream_once(self, op: str, kwargs: dict) -> Iterator[Any]:
+        with self._host.use() as handle:
+            with self._retire_on_crash(handle):
+                req_id, q = handle.open_request(op, kwargs)
+                try:
+                    while True:
+                        kind, payload = q.get()
+                        if kind == "chunk":
+                            self._mark_used(op)
+                            yield payload
+                        elif kind == "end":
+                            break
+                        elif kind == "error":
+                            raise _rebuild_exception(payload)
+                        elif kind == "crash":
+                            raise WorkerCrashError(payload)
+                finally:
+                    handle.close_request(req_id)
+
+    @contextmanager
+    def _retire_on_crash(self, handle: _WorkerHandle) -> Iterator[None]:
+        """Drop a dead worker so the next ``use()`` spawns a fresh one.
+
+        The reader thread already does this when it sees the pipe close, but
+        a send to an already-dead worker raises before the reader notices.
+        """
+        try:
+            yield
+        except WorkerCrashError:
+            self._host.invalidate(handle)
+            raise
 
     def _wait_result(self, q: queue.Queue) -> Any:
         while True:
