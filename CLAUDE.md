@@ -65,6 +65,10 @@ CLI Command → Unix Socket IPC → Daemon
 
 **Disposable Inference Worker**: STT/TTS inference runs in a child process spawned lazily on the first request (`worker_host.py` parent side, `worker.py` child side). After the shared idle timeout (default 15 min) with no active operations, the worker process is terminated — process exit is what reliably releases VRAM; `torch.cuda.empty_cache()` in a live process does not. The next request transparently starts a fresh worker. The parent process must never import torch/NeMo/Kokoro (guarded by `tests/test_parent_imports.py`).
 
+A worker that dies mid-request is retried once on a fresh process (`WorkerHost.request`; streams only retry before the first chunk reaches the consumer), so a crash costs latency instead of the request.
+
+**Native library load order**: `worker.preload_native_stack()` imports `pyarrow.dataset` and `lhotse` on the worker's main thread before any model loads. The STT stack (NeMo → lhotse → pyarrow) segfaults inside Arrow's mimalloc allocator when it is loaded into a process that already holds Kokoro and torch; the reverse order is safe. Without the preload, request order decided library order and a TTS-then-STT worker died.
+
 **HTTP Client-Server Mode**: For remote STT/TTS:
 - `http_server.py` - HTTP server with `/transcribe`, `/synthesize`, `/health` endpoints
 - `http_client.py` - HTTP client for remote connections
