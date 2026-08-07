@@ -16,6 +16,7 @@ import itertools
 import logging
 import queue
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from multiprocessing import get_context
@@ -41,9 +42,31 @@ _START_TIMEOUT = 120.0
 _GRACEFUL_TIMEOUT = 10.0
 _KILL_TIMEOUT = 5.0
 
+# Liveness backstop, not a scheduler. GPU work is serialized inside the worker,
+# so one wedged call would otherwise hold the device and stall every later
+# request forever. Measured on an RTX 4090: Parakeet decodes 60s of audio in
+# ~190ms and Kokoro runs at RTF ~0.05, so these ceilings are orders of magnitude
+# above anything legitimate.
+#
+# Two classes, because the parent cannot know the duration for path-based ops —
+# worker.py sends a path, not audio, and reading it here would mean decoding
+# audio in a process that deliberately avoids that.
+_ARRAY_OP_MIN_DEADLINE = 30.0
+_ARRAY_OP_DURATION_FACTOR = 10.0
+_PATH_OP_DEADLINE = 900.0
+_PATH_OPS = frozenset({"stt.transcribe_file", "stt.transcribe_file_with_segments"})
+
 
 class WorkerCrashError(RuntimeError):
     """The inference worker died while an operation was in flight."""
+
+
+class WorkerTimeoutError(RuntimeError):
+    """The worker accepted an operation and never answered.
+
+    Raised after the worker has been killed, so the next request gets a fresh
+    process rather than queuing behind a wedged one.
+    """
 
 
 class WorkerOperationError(RuntimeError):
@@ -134,6 +157,8 @@ class WorkerHost:
         start_timeout: float = _START_TIMEOUT,
         graceful_timeout: float = _GRACEFUL_TIMEOUT,
         kill_timeout: float = _KILL_TIMEOUT,
+        array_op_min_deadline: float = _ARRAY_OP_MIN_DEADLINE,
+        path_op_deadline: float = _PATH_OP_DEADLINE,
     ):
         self._config = config
         self._transcriber_factory = transcriber_factory
@@ -142,6 +167,8 @@ class WorkerHost:
         self._start_timeout = start_timeout
         self._graceful_timeout = graceful_timeout
         self._kill_timeout = kill_timeout
+        self._array_op_min_deadline = array_op_min_deadline
+        self._path_op_deadline = path_op_deadline
 
         self._stt_used = False
         self._tts_used = False
@@ -304,24 +331,57 @@ class WorkerHost:
             logger.warning(f"Worker died during {op} ({exc}); retrying on a fresh worker")
         yield from self._stream_once(op, kwargs)
 
+    def _deadline_for(self, op: str, kwargs: dict) -> float:
+        """How long to wait before declaring the worker wedged."""
+        if op in _PATH_OPS:
+            return self._path_op_deadline
+
+        audio = kwargs.get("audio")
+        seconds = 0.0
+        if isinstance(audio, np.ndarray) and audio.size:
+            rate = kwargs.get("sample_rate") or 16000
+            if rate > 0:
+                seconds = audio.size / rate
+        return max(self._array_op_min_deadline, _ARRAY_OP_DURATION_FACTOR * seconds)
+
     def _request_once(self, op: str, kwargs: dict) -> Any:
+        deadline = self._deadline_for(op, kwargs)
         with self._host.use() as handle:
             with self._retire_on_crash(handle):
                 req_id, q = handle.open_request(op, kwargs)
                 try:
-                    result = self._wait_result(q)
+                    result = self._wait_result(q, deadline)
+                except WorkerTimeoutError:
+                    # The worker is wedged, not slow. Kill it rather than leave
+                    # every later request queued behind it, and do not retry —
+                    # a hung op would simply hang again.
+                    logger.error(f"Worker did not answer {op} within {deadline:.0f}s; killing it")
+                    self._host.invalidate(handle)
+                    self._kill_handle(handle)
+                    raise
                 finally:
                     handle.close_request(req_id)
             self._mark_used(op)
             return result
 
     def _stream_once(self, op: str, kwargs: dict) -> Iterator[Any]:
+        # Applied per chunk, not to the whole stream: a long utterance is many
+        # short generations, so silence between chunks is the wedge signal.
+        deadline = self._array_op_min_deadline
         with self._host.use() as handle:
             with self._retire_on_crash(handle):
                 req_id, q = handle.open_request(op, kwargs)
                 try:
                     while True:
-                        kind, payload = q.get()
+                        try:
+                            kind, payload = q.get(timeout=deadline)
+                        except queue.Empty:
+                            logger.error(
+                                f"Worker sent no {op} chunk within {deadline:.0f}s; killing it"
+                            )
+                            self._host.invalidate(handle)
+                            self._kill_handle(handle)
+                            raise WorkerTimeoutError(f"worker stalled mid-stream on {op}") from None
                         if kind == "chunk":
                             self._mark_used(op)
                             yield payload
@@ -333,6 +393,23 @@ class WorkerHost:
                             raise WorkerCrashError(payload)
                 finally:
                     handle.close_request(req_id)
+
+    def _kill_handle(self, handle: _WorkerHandle) -> None:
+        """Force a wedged worker down. Skips the graceful phase: it answers the
+        pipe from the main loop, which a stuck GPU call has not blocked, so a
+        polite shutdown would look like it worked while the op ran on."""
+        try:
+            if handle.alive:
+                handle.process.kill()
+                handle.process.join(timeout=self._kill_timeout)
+        except Exception:
+            logger.exception("Failed to kill the wedged worker")
+        finally:
+            try:
+                handle.conn.close()
+            except OSError:
+                pass
+            handle.fail_pending("inference worker was killed after a timeout")
 
     @contextmanager
     def _retire_on_crash(self, handle: _WorkerHandle) -> Iterator[None]:
@@ -347,9 +424,16 @@ class WorkerHost:
             self._host.invalidate(handle)
             raise
 
-    def _wait_result(self, q: queue.Queue) -> Any:
+    def _wait_result(self, q: queue.Queue, deadline: float) -> Any:
+        expires_at = time.monotonic() + deadline
         while True:
-            kind, payload = q.get()
+            remaining = expires_at - time.monotonic()
+            if remaining <= 0:
+                raise WorkerTimeoutError(f"worker did not respond within {deadline:.0f}s")
+            try:
+                kind, payload = q.get(timeout=remaining)
+            except queue.Empty:
+                raise WorkerTimeoutError(f"worker did not respond within {deadline:.0f}s") from None
             if kind == "result":
                 return payload
             if kind == "error":

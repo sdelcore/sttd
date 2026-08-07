@@ -14,6 +14,7 @@ if not hasattr(torchaudio, "list_audio_backends"):
     torchaudio.list_audio_backends = lambda: ["soundfile"]
 
 from voiced.config import DiarizationConfig
+from voiced.gpu import gpu_exclusive
 from voiced.profiles import ProfileManager, VoiceProfile
 
 # Segment types and alignment live in the torch-free voiced.speaker_segments
@@ -61,11 +62,22 @@ class SpeakerEmbedder:
             from speechbrain.inference.speaker import EncoderClassifier
 
             logger.info(f"Loading SpeechBrain embedding model on {self.device}")
-            run_opts = {"device": self.device}
+            # compile=False is load-bearing, not a default restated. SpeechBrain
+            # takes this from the downloaded hyperparams.yaml when run_opts omits
+            # it, and its compile_mode defaults to "reduce-overhead" — which is
+            # CUDA graphs. Capture in this process would reintroduce exactly the
+            # hazard voiced disables in transcriber._load_model.
+            run_opts = {"device": self.device, "compile": False}
             self._classifier = EncoderClassifier.from_hparams(
                 source=self.model_source,
                 run_opts=run_opts,
             )
+            if getattr(self._classifier, "compile", False):
+                raise RuntimeError(
+                    "SpeechBrain enabled torch.compile despite compile=False. "
+                    "Refusing to continue — compile_mode='reduce-overhead' captures "
+                    "CUDA graphs, which corrupts concurrent inference. See voiced/gpu.py."
+                )
         return self._classifier
 
     def extract_embedding(self, audio_path: str | Path) -> np.ndarray:
@@ -87,8 +99,10 @@ class SpeakerEmbedder:
         # Convert to torch tensor with shape (1, samples)
         signal = torch.from_numpy(audio).float().unsqueeze(0)
 
-        embedding = self.classifier.encode_batch(signal)
-        return embedding.squeeze().cpu().numpy()
+        classifier = self.classifier
+        with gpu_exclusive("diar.embed"):
+            embedding = classifier.encode_batch(signal)
+            return embedding.squeeze().cpu().numpy()
 
     def extract_embedding_from_array(
         self,
@@ -110,8 +124,10 @@ class SpeakerEmbedder:
         # Convert to torch tensor with shape (1, samples)
         signal = torch.from_numpy(audio).float().unsqueeze(0)
 
-        embedding = self.classifier.encode_batch(signal)
-        return embedding.squeeze().cpu().numpy()
+        classifier = self.classifier
+        with gpu_exclusive("diar.embed"):
+            embedding = classifier.encode_batch(signal)
+            return embedding.squeeze().cpu().numpy()
 
     def unload(self) -> None:
         """Unload model to free memory."""

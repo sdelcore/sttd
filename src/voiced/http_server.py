@@ -24,6 +24,7 @@ from voiced.profile_store import LocalProfileStore, RemoteProfileStore  # noqa: 
 from voiced.profiles import ProfileManager
 from voiced.transcriber import STT_MODEL, Transcriber
 from voiced.webrtc_server import WebRTCConnectionManager
+from voiced.worker_host import WorkerTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -530,6 +531,11 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
                     "segments": segments_output,
                 },
             )
+        except WorkerTimeoutError as e:
+            # Distinct from a failed transcription: the worker was wedged and
+            # has been killed. 504 so this is not read as bad audio.
+            logger.error(f"Transcription timed out: {e}")
+            self._send_error_json(504, f"Transcription timed out: {e}", "WORKER_TIMEOUT")
         except Exception as e:
             logger.exception(f"Transcription failed: {e}")
             self._send_error_json(500, f"Transcription failed: {e}", "TRANSCRIPTION_ERROR")
@@ -907,6 +913,11 @@ class TranscriptionHandler(BaseHTTPRequestHandler):
                 identify_speakers=False,
                 profile_store=self._profile_store_for(None),
             )
+        except WorkerTimeoutError as e:
+            # Distinct from a failed transcription: the worker was wedged and
+            # has been killed. 504 so this is not read as bad audio.
+            logger.error(f"Transcription timed out: {e}")
+            self._send_error_json(504, f"Transcription timed out: {e}", "WORKER_TIMEOUT")
         except Exception as e:
             logger.exception(f"Transcription failed: {e}")
             self._send_error_json(500, f"Transcription failed: {e}", "TRANSCRIPTION_ERROR")

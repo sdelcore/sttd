@@ -28,6 +28,7 @@ cannot tolerate an arbitrary one. The module itself must stay import-light:
 
 import importlib
 import logging
+import os
 import signal
 import threading
 import time
@@ -157,9 +158,18 @@ class _WorkerState:
 
     @property
     def transcriber(self) -> Any:
+        # This lock guards construction only. Serializing the model CALLS is the
+        # job of voiced.gpu.gpu_exclusive, held inside each wrapper — see
+        # voiced/gpu.py for why a construction lock was never enough.
         with self._model_lock:
             if self._transcriber is None:
-                self._transcriber = self._transcriber_factory(self.config)
+                transcriber = self._transcriber_factory(self.config)
+                # Warm inside the lock so the first real request never races a
+                # half-initialised decoder.
+                warmup = getattr(transcriber, "warmup", None)
+                if warmup is not None:
+                    warmup()
+                self._transcriber = transcriber
             return self._transcriber
 
     @property
@@ -222,6 +232,31 @@ def _dispatch(state: _WorkerState, op: str, kwargs: dict) -> Any:
     return {"value": value, "device": state.transcriber.device}
 
 
+def _is_unrecoverable_cuda_error(exc: BaseException) -> bool:
+    """Whether ``exc`` leaves this process's CUDA state permanently broken.
+
+    Classified by TYPE, not by matching message text, so a NeMo or torch upgrade
+    that rewords an error cannot silently turn a fatal condition into a retry
+    loop.
+
+    OOM is deliberately excluded. It is not sticky — it usually means llama-swap
+    took the VRAM — and restarting the worker does not create memory, so the
+    request should simply fail.
+    """
+    try:
+        import torch
+    except Exception:
+        return False
+
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return False
+    if isinstance(exc, getattr(torch, "AcceleratorError", ())):
+        return True
+    # A context-level CUDA fault surfaces as a plain RuntimeError; the "CUDA
+    # error:" prefix is torch's own and is the only signal available.
+    return isinstance(exc, RuntimeError) and "CUDA error:" in str(exc)
+
+
 def _run_request(state: _WorkerState, req_id: int, op: str, kwargs: dict) -> None:
     try:
         if op in STREAMING_OPS:
@@ -238,6 +273,25 @@ def _run_request(state: _WorkerState, req_id: int, op: str, kwargs: dict) -> Non
             state.send(("error", req_id, _describe_exception(exc)))
         except OSError:
             logger.warning("Parent connection lost while reporting error")
+
+        if _is_unrecoverable_cuda_error(exc):
+            # The CUDA context is dead. Every later request in this process
+            # would fail the same way, which is how one collision silently
+            # disabled voice input for four hours. Exit so the parent respawns
+            # a clean worker instead of serving a broken one.
+            logger.critical(
+                f"Unrecoverable CUDA fault during {op}; exiting so the worker is replaced: {exc}"
+            )
+            _flush_logs()
+            os._exit(70)  # EX_SOFTWARE
+
+
+def _flush_logs() -> None:
+    for handler in logging.getLogger().handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
 
 
 def worker_main(
