@@ -67,6 +67,17 @@ CLI Command → Unix Socket IPC → Daemon
 
 A worker that dies mid-request is retried once on a fresh process (`WorkerHost.request`; streams only retry before the first chunk reaches the consumer), so a crash costs latency instead of the request.
 
+**Serialized GPU inference (`gpu.py`)**: Every call into a loaded model runs inside `gpu_exclusive()`. This is a correctness requirement, not a performance tuning knob — read `src/voiced/gpu.py` before touching any model call site.
+
+Two hazards force it, and neither is a backup for the other:
+
+1. *NeMo is not re-entrant.* `transcribe()` freezes the encoder/decoder/joint and stashes `training`, `dither`, and `pad_to` on the module, then restores them on exit. Two overlapping calls on one model tear down each other's state. This races on CPU too. Upstream has no lock of its own (NVIDIA/NeMo#15771).
+2. *CUDA graph capture is process-scoped.* While a capture is underway no other thread in the process may issue CUDA work, and a lock cannot cover work outside model calls (the cyclic GC frees tensors on arbitrary threads). So `transcriber._load_model` **disables** NeMo's graph decoder outright and raises if it cannot. Do not "optimise" that back on: NeMo captures with `capture_error_mode="thread_local"`, which turns CUDA's cross-thread check *off*, so a violation is undefined behaviour rather than an error.
+
+Before this existed, two concurrent requests returned `HTTP 200` with a **silently wrong transcript**, and a third poisoned the CUDA graph so every later request failed until the worker restarted. `tests/test_concurrency_stt.py` guards it against a golden baseline and includes a negative control that strips the lock and asserts the corruption returns.
+
+Lock ordering: `gpu_exclusive()` is innermost. Taking `ModelHost._lock` then the GPU lock is correct; the reverse deadlocks.
+
 **Native library load order**: `worker.preload_native_stack()` imports `pyarrow.dataset` and `lhotse` on the worker's main thread before any model loads. The STT stack (NeMo → lhotse → pyarrow) segfaults inside Arrow's mimalloc allocator when it is loaded into a process that already holds Kokoro and torch; the reverse order is safe. Without the preload, request order decided library order and a TTS-then-STT worker died.
 
 **HTTP Client-Server Mode**: For remote STT/TTS:

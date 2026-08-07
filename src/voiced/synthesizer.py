@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from voiced.device import resolve_device_config
+from voiced.gpu import gpu_exclusive
 from voiced.model_host import ModelHost
 from voiced.voice_manager import VoiceManager
 
@@ -93,7 +94,8 @@ class Synthesizer:
         self._pipelines.clear()
         self.voice_manager.clear_memory_cache()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            with gpu_exclusive("tts.unload"):
+                torch.cuda.empty_cache()
 
     def _pipeline_for(self, model: Any, voice: str) -> Any:
         """Get or create the phonemization pipeline for the voice's accent."""
@@ -116,15 +118,26 @@ class Synthesizer:
         voice = (voice or self.config.default_voice).lower()
         speed = speed if speed is not None else self.config.speed
 
-        pipeline = self._pipeline_for(model, voice)
-        voice_tensor = self.voice_manager.load_voice_tensor(voice)
+        with gpu_exclusive("tts.pipeline_init"):
+            pipeline = self._pipeline_for(model, voice)
+            voice_tensor = self.voice_manager.load_voice_tensor(voice)
 
-        for result in pipeline(text, voice=voice_tensor, speed=speed, split_pattern=SPLIT_PATTERN):
-            _graphemes, _phonemes, audio = result
-            if audio is None:
-                continue
-            if torch.is_tensor(audio):
-                audio = audio.float().cpu().numpy()
+        # Advance the generator one sentence per acquisition rather than holding
+        # the device for the whole utterance, so an STT request is never queued
+        # behind a long stream. The tensor->numpy copy stays inside the lock.
+        # iter() because Kokoro returns a generator but a sequence is also valid.
+        chunks = iter(pipeline(text, voice=voice_tensor, speed=speed, split_pattern=SPLIT_PATTERN))
+        while True:
+            with gpu_exclusive("tts.chunk"):
+                try:
+                    result = next(chunks)
+                except StopIteration:
+                    return
+                _graphemes, _phonemes, audio = result
+                if audio is None:
+                    continue
+                if torch.is_tensor(audio):
+                    audio = audio.float().cpu().numpy()
             yield np.squeeze(audio).astype(np.float32)
 
     def synthesize(
